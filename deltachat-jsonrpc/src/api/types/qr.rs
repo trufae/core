@@ -7,7 +7,7 @@ use typescript_type_def::TypeDef;
 #[serde(rename = "Qr", rename_all = "camelCase")]
 #[serde(tag = "kind")]
 pub enum QrObject {
-    /// Ask the user whether to verify the contact.
+    /// Ask the user whether to start chatting with the contact.
     ///
     /// If the user agrees, pass this QR code to [`crate::securejoin::join_securejoin`].
     AskVerifyContact {
@@ -61,22 +61,12 @@ pub enum QrObject {
         /// Whether the inviter supports the new Securejoin v3 protocol
         is_v3: bool,
     },
-    /// Contact fingerprint is verified.
+    /// Contact fingerprint matches.
     ///
     /// Ask the user if they want to start chatting.
     FprOk {
         /// Contact ID.
         contact_id: u32,
-    },
-    /// Scanned fingerprint does not match the last seen fingerprint.
-    FprMismatch {
-        /// Contact ID.
-        contact_id: Option<u32>,
-    },
-    /// The scanned QR code contains a fingerprint but no e-mail address.
-    FprWithoutAddr {
-        /// Key fingerprint.
-        fingerprint: String,
     },
     /// Ask the user if they want to create an account on the given domain.
     Account {
@@ -296,11 +286,6 @@ impl From<Qr> for QrObject {
                 let contact_id = contact_id.to_u32();
                 QrObject::FprOk { contact_id }
             }
-            Qr::FprMismatch { contact_id } => {
-                let contact_id = contact_id.map(|contact_id| contact_id.to_u32());
-                QrObject::FprMismatch { contact_id }
-            }
-            Qr::FprWithoutAddr { fingerprint } => QrObject::FprWithoutAddr { fingerprint },
             Qr::Account { domain } => QrObject::Account { domain },
             Qr::Backup2 {
                 ref node_addr,

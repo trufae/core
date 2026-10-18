@@ -1702,7 +1702,10 @@ async fn test_shall_attach_selfavatar() -> Result<()> {
     add_contact_to_chat(alice, chat_id, contact_id).await?;
     assert!(shall_attach_selfavatar(alice, chat_id).await?);
 
-    chat_id.set_selfavatar_timestamp(alice, time()).await?;
+    alice
+        .sql
+        .transaction(|transaction| chat_id.set_selfavatar_timestamp(transaction, time()))
+        .await?;
     assert!(!shall_attach_selfavatar(alice, chat_id).await?);
 
     alice.set_config(Config::Selfavatar, None).await?; // setting to None also forces re-sending
@@ -3000,13 +3003,13 @@ async fn test_broadcast_change_name() -> Result<()> {
 
         tcm.section("Bob receives the name-change system message");
         let msg = bob.recv_msg(&sent).await;
-        assert_eq!(msg.subject, "Re: My great broadcast");
+        assert_eq!(msg.subject, "My great broadcast");
         let bob_chat = Chat::load_from_db(bob, msg.chat_id).await?;
         assert_eq!(bob_chat.name, "My great broadcast");
 
         tcm.section("Fiona receives the name-change system message");
         let msg = fiona.recv_msg(&sent).await;
-        assert_eq!(msg.subject, "Re: My great broadcast");
+        assert_eq!(msg.subject, "My great broadcast");
         let fiona_chat = Chat::load_from_db(fiona, msg.chat_id).await?;
         assert_eq!(fiona_chat.name, "My great broadcast");
     }
@@ -3340,41 +3343,27 @@ async fn test_broadcast_recipients_sync1() -> Result<()> {
     alice2.assert_warn("unknown grpid").await;
 
     let member_added = alice1.pop_sent_msg().await;
-    let a2_charlie_added = alice2.recv_msg(&member_added).await;
+    alice2.recv_msg_trash(&member_added).await;
     let _c_member_added = charlie.recv_msg(&member_added).await;
-    let a2_chatlist = Chatlist::try_load(alice2, 0, Some("Channel"), None).await?;
-    assert_eq!(a2_chatlist.get_msg_id(0)?.unwrap(), a2_charlie_added.id);
 
     // Alice1 will now sync the full member list to Alice2:
     sync(alice1, alice2).await;
     let a2_bob_contact = alice2.add_or_lookup_contact_id(bob).await;
     let a2_charlie_contact = alice2.add_or_lookup_contact_id(charlie).await;
     let a2_chatlist = Chatlist::try_load(alice2, 0, Some("Channel"), None).await?;
-    let msg_id = a2_chatlist.get_msg_id(0)?.unwrap();
-    let a2_bob_added = Message::load_from_db(alice2, msg_id).await?;
-    assert_ne!(a2_bob_added.id, a2_charlie_added.id);
-    assert_eq!(
-        a2_bob_added.text,
-        stock_str::msg_add_member_local(alice2, a2_bob_contact, ContactId::UNDEFINED).await
-    );
-    assert_eq!(a2_bob_added.from_id, ContactId::SELF);
-    assert_eq!(
-        a2_bob_added.param.get_cmd(),
-        SystemMessage::MemberAddedToGroup
-    );
-    assert_eq!(
-        ContactId::new(
-            a2_bob_added
-                .param
-                .get_int(Param::ContactAddedRemoved)
-                .unwrap()
-                .try_into()
-                .unwrap()
-        ),
-        a2_bob_contact
-    );
+    let a2_chat_id = a2_chatlist.get_chat_id(0).unwrap();
 
-    let a2_chat_members = get_chat_contacts(alice2, a2_charlie_added.chat_id).await?;
+    // Also for Alice2, no info message should be shown;
+    // she should see only the "Messages are end-to-end encrypted" message.
+    let a2_chat_msgs = get_chat_msgs(alice2, a2_chat_id).await?;
+    assert_eq!(a2_chat_msgs.len(), 1);
+    let ChatItem::Message { msg_id } = a2_chat_msgs[0] else {
+        unreachable!()
+    };
+    let a2_msg = Message::load_from_db(alice2, msg_id).await?;
+    assert_eq!(a2_msg.get_info_type(), SystemMessage::ChatE2ee);
+
+    let a2_chat_members = get_chat_contacts(alice2, a2_chat_id).await?;
     assert!(a2_chat_members.contains(&a2_bob_contact));
     assert!(a2_chat_members.contains(&a2_charlie_contact));
     assert_eq!(a2_chat_members.len(), 2);
@@ -3756,25 +3745,6 @@ async fn test_broadcast_joining_golden() -> Result<()> {
         )
         .await;
 
-    assert_eq!(
-        alice_bob_contact
-            .get_verifier_id(alice)
-            .await?
-            .unwrap()
-            .unwrap(),
-        ContactId::SELF
-    );
-
-    let bob_alice_contact = bob.add_or_lookup_contact_no_key(alice).await;
-    assert_eq!(
-        bob_alice_contact
-            .get_verifier_id(bob)
-            .await?
-            .unwrap()
-            .unwrap(),
-        ContactId::SELF
-    );
-
     Ok(())
 }
 
@@ -4057,10 +4027,9 @@ async fn test_leave_broadcast_multidevice() -> Result<()> {
     bob1.recv_msg(&member_added).await;
 
     // The single chat should not be visible to the user on any of the devices.
-    // The contact should be marked as verified.
-    check_single_chat_is_hidden_and_contact_is_verified(alice, bob0).await;
-    check_single_chat_is_hidden_and_contact_is_verified(bob0, alice).await;
-    check_single_chat_is_hidden_and_contact_is_verified(bob1, alice).await;
+    check_single_chat_is_hidden(alice, bob0).await;
+    check_single_chat_is_hidden(bob0, alice).await;
+    check_single_chat_is_hidden(bob1, alice).await;
 
     tcm.section("Alice sends first message to broadcast.");
     let sent_msg = alice.send_text(alice_chat_id, "Hello!").await;
@@ -4087,10 +4056,7 @@ async fn test_leave_broadcast_multidevice() -> Result<()> {
     Ok(())
 }
 
-async fn check_single_chat_is_hidden_and_contact_is_verified(
-    t: &TestContext,
-    contact: &TestContext,
-) {
+async fn check_single_chat_is_hidden(t: &TestContext, contact: &TestContext) {
     let contact = t.add_or_lookup_contact_no_key(contact).await;
     if let Some(single_chat) = ChatIdBlocked::lookup_by_contact(t, contact.id)
         .await
@@ -4098,7 +4064,6 @@ async fn check_single_chat_is_hidden_and_contact_is_verified(
     {
         assert_eq!(single_chat.blocked, Blocked::Yes);
     }
-    assert!(contact.is_verified(t).await.unwrap());
 }
 
 /// Test that only the owner of the broadcast channel

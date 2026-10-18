@@ -19,7 +19,7 @@ use crate::chat::{
 };
 use crate::config::Config;
 use crate::constants::{Blocked, Chattype, EDITED_PREFIX};
-use crate::contact::{self, Contact, ContactId, Origin, mark_contact_id_as_verified};
+use crate::contact::{self, Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::debug_logging::maybe_set_logging_xdc_inner;
 use crate::download::{DownloadState, msg_is_downloaded_for};
@@ -27,7 +27,7 @@ use crate::ephemeral::{Timer as EphemeralTimer, stock_ephemeral_timer_changed};
 use crate::events::EventType;
 use crate::headerdef::HeaderDef;
 use crate::imap::{GENERATED_PREFIX, markseen_on_imap_table};
-use crate::key::{DcKey, Fingerprint};
+use crate::key::{DcKey, Fingerprint, SignedPublicKey};
 use crate::key::{
     load_self_public_key, load_self_public_key_opt, self_fingerprint, self_fingerprint_opt,
 };
@@ -36,7 +36,7 @@ use crate::message::{
     self, Message, MessageState, MsgId, Viewtype, insert_tombstone, rfc724_mid_exists,
 };
 use crate::mimeparser::{
-    AvatarAction, GossipedKey, MimeMessage, PreMessageMode, SystemMessage, parse_message_ids,
+    AvatarAction, MimeMessage, PreMessageMode, SystemMessage, parse_message_ids,
 };
 use crate::param::{Param, Params};
 use crate::peer_channels::{add_gossip_peer_from_header, insert_topic_stub, iroh_topic_from_str};
@@ -483,7 +483,7 @@ pub(crate) async fn receive_imf_inner(
     }
 
     let trash = || async {
-        let msg_ids = vec![insert_tombstone(context, rfc724_mid).await?];
+        let msg_ids = vec![insert_tombstone(context, rfc724_mid, false).await?];
         Ok(Some(ReceivedMsg {
             chat_id: ChatId::TRASH,
             state: MessageState::Undefined,
@@ -568,16 +568,12 @@ pub(crate) async fn receive_imf_inner(
         //
         // Note that messages with long recipient lists are sent out in chunks,
         // removing already sent recipients from the job after each chunk.
-        // Self recipients are added at the end so removing the job
-        // removes the last chunk which apparently went out fine.
-        let self_addr = context.get_primary_self_addr().await?;
+        // Self recipients are sent in the end,
+        // so if we received a copy, the message has been sent out
+        // to all recipients.
         context
             .sql
-            .execute(
-                "DELETE FROM smtp \
-                WHERE rfc724_mid=?1 AND (recipients LIKE ?2 OR recipients LIKE ('% ' || ?2))",
-                (rfc724_mid_orig, &self_addr),
-            )
+            .execute("DELETE FROM smtp2 WHERE rfc724_mid=?", (rfc724_mid_orig,))
             .await?;
         if !msg_has_pending_smtp_job(context, msg_id).await? {
             msg_id.set_delivered(context).await?;
@@ -658,7 +654,6 @@ pub(crate) async fn receive_imf_inner(
                     )
                 })?
         } else if let Some(to_id) = to_ids.first().copied().flatten() {
-            // handshake may mark contacts as verified and must be processed before chats are created
             observe_securejoin_on_other_device(context, &mime_parser, to_id)
                 .await
                 .with_context(|| {
@@ -673,14 +668,15 @@ pub(crate) async fn receive_imf_inner(
 
         match res {
             securejoin::HandshakeMessage::Done | securejoin::HandshakeMessage::Ignore => {
-                let msg_id = insert_tombstone(context, rfc724_mid).await?;
+                let needs_delete_job = res == securejoin::HandshakeMessage::Done;
+                let msg_id = insert_tombstone(context, rfc724_mid, needs_delete_job).await?;
                 received_msg = Some(ReceivedMsg {
                     chat_id: ChatId::TRASH,
                     state: MessageState::InSeen,
                     hidden: false,
                     sort_timestamp: mime_parser.timestamp_sent,
                     msg_ids: vec![msg_id],
-                    needs_delete_job: res == securejoin::HandshakeMessage::Done,
+                    needs_delete_job,
                 });
             }
             securejoin::HandshakeMessage::Propagate => {
@@ -689,12 +685,6 @@ pub(crate) async fn receive_imf_inner(
         }
     } else {
         received_msg = None;
-    }
-
-    let verified_encryption = has_verified_encryption(context, &mime_parser, from_id).await?;
-
-    if verified_encryption == VerifiedEncryption::Verified {
-        mark_recipients_as_verified(context, from_id, &mime_parser).await?;
     }
 
     let is_old_contact_request;
@@ -2118,7 +2108,8 @@ async fn add_parts(
         let hidden = part.is_reaction;
         if part.is_reaction {
             let reaction_str = simplify::remove_footers(part.msg.as_str());
-            let is_incoming_fresh = mime_parser.incoming && !seen;
+            let is_incoming_fresh =
+                mime_parser.incoming && !seen && chat_id_blocked == Blocked::Not;
             set_msg_reaction(
                 context,
                 mime_in_reply_to,
@@ -2321,7 +2312,7 @@ INSERT INTO msgs
         // This way, `LastSubject` actually refers to the most recent message _shown_ in the chat.
         if chat
             .param
-            .update_timestamp(Param::SubjectTimestamp, sort_timestamp)?
+            .update_timestamp(Param::SubjectTimestamp, sort_timestamp)
         {
             // write the last subject even if empty -
             // otherwise a reply may get an outdated subject.
@@ -2402,6 +2393,7 @@ async fn handle_edit_delete(
         }
 
         let mut modified_chat_ids = BTreeSet::new();
+        let mut pinned_messages_changed_chat_ids = BTreeSet::new();
         let mut msg_ids = Vec::new();
 
         let rfc724_mid_vec: Vec<&str> = rfc724_mid_list.split_whitespace().collect();
@@ -2410,7 +2402,7 @@ async fn handle_edit_delete(
             let Some(msg_id) = message::rfc724_mid_exists(context, rfc724_mid).await? else {
                 warn!(context, "Delete message: {rfc724_mid:?} not found.");
                 // Insert a tombstone so that the message will be ignored if it arrives later within a period specified in prune_tombstones().
-                insert_tombstone(context, rfc724_mid).await?;
+                insert_tombstone(context, rfc724_mid, false).await?;
                 continue;
             };
 
@@ -2426,8 +2418,17 @@ async fn handle_edit_delete(
             message::delete_msg_locally(context, &msg).await?;
             msg_ids.push(msg.id);
             modified_chat_ids.insert(msg.chat_id);
+            if msg.is_pinned() {
+                pinned_messages_changed_chat_ids.insert(msg.chat_id);
+            }
         }
-        message::delete_msgs_locally_done(context, &msg_ids, modified_chat_ids).await?;
+        message::delete_msgs_locally_done(
+            context,
+            &msg_ids,
+            modified_chat_ids,
+            pinned_messages_changed_chat_ids,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2996,7 +2997,7 @@ struct GroupChangesInfo {
     extra_msgs: Vec<(String, SystemMessage, Option<ContactId>)>,
 }
 
-/// Apply group member list, name, avatar and protection status changes from the MIME message.
+/// Apply group member list, name and avatar changes from the MIME message.
 ///
 /// Returns [GroupChangesInfo].
 ///
@@ -3064,7 +3065,7 @@ async fn apply_group_changes(
             // just like we look at ChatGroupMemberRemovedFpr.
             // The result of the error is that info message
             // may contain display name of the wrong contact.
-            let fingerprint = key.public_key.dc_fingerprint().hex();
+            let fingerprint = key.dc_fingerprint().hex();
             if let Some(contact_id) =
                 lookup_key_contact_by_fingerprint(context, &fingerprint).await?
             {
@@ -3414,7 +3415,7 @@ async fn apply_chat_name_avatar_and_description_changes(
         && is_from_in_chat
         && chat
             .param
-            .update_timestamp(Param::AvatarTimestamp, mime_parser.timestamp_sent)?
+            .update_timestamp(Param::AvatarTimestamp, mime_parser.timestamp_sent)
     {
         info!(context, "Group-avatar change for {}.", chat.id);
         match avatar_action {
@@ -3743,10 +3744,9 @@ async fn apply_out_broadcast_changes(
         if from_id == ContactId::SELF {
             let added_id = lookup_key_contact_by_fingerprint(context, added_fpr).await?;
             if let Some(added_id) = added_id {
-                if chat::is_contact_in_chat(context, chat.id, added_id).await? {
-                    info!(context, "No-op broadcast addition (TRASH)");
-                    better_msg.get_or_insert("".to_string());
-                } else {
+                info!(context, "Broadcast addition (TRASH)");
+                better_msg.get_or_insert("".to_string());
+                if !chat::is_contact_in_chat(context, chat.id, added_id).await? {
                     chat::add_to_chat_contacts_table(
                         context,
                         mime_parser.timestamp_sent,
@@ -3754,11 +3754,6 @@ async fn apply_out_broadcast_changes(
                         &[added_id],
                     )
                     .await?;
-                    let msg =
-                        stock_str::msg_add_member_local(context, added_id, ContactId::UNDEFINED)
-                            .await;
-                    better_msg.get_or_insert(msg);
-                    added_removed_id = Some(added_id);
                     send_event_chat_modified = true;
                 }
             } else {
@@ -3971,89 +3966,6 @@ async fn create_adhoc_group(
     Ok(Some((new_chat_id, create_blocked)))
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum VerifiedEncryption {
-    Verified,
-    NotVerified(String), // The string contains the reason why it's not verified
-}
-
-/// Checks whether the message is allowed to appear in a protected chat.
-///
-/// This means that it is encrypted and signed with a verified key.
-async fn has_verified_encryption(
-    context: &Context,
-    mimeparser: &MimeMessage,
-    from_id: ContactId,
-) -> Result<VerifiedEncryption> {
-    use VerifiedEncryption::*;
-
-    if !mimeparser.was_encrypted() {
-        return Ok(NotVerified("This message is not encrypted".to_string()));
-    };
-
-    if from_id == ContactId::SELF {
-        return Ok(Verified);
-    }
-
-    let from_contact = Contact::get_by_id(context, from_id).await?;
-
-    let Some(fingerprint) = from_contact.fingerprint() else {
-        return Ok(NotVerified(
-            "The message was sent without encryption".to_string(),
-        ));
-    };
-
-    if from_contact.get_verifier_id(context).await?.is_none() {
-        return Ok(NotVerified(
-            "The message was sent by non-verified contact".to_string(),
-        ));
-    }
-
-    let signed_with_verified_key = mimeparser
-        .signature
-        .as_ref()
-        .is_some_and(|(signature, _)| *signature == fingerprint);
-    if signed_with_verified_key {
-        Ok(Verified)
-    } else {
-        Ok(NotVerified(
-            "The message was sent with non-verified encryption".to_string(),
-        ))
-    }
-}
-
-async fn mark_recipients_as_verified(
-    context: &Context,
-    from_id: ContactId,
-    mimeparser: &MimeMessage,
-) -> Result<()> {
-    let verifier_id = Some(from_id).filter(|&id| id != ContactId::SELF);
-
-    // We don't yet send the _verified property in autocrypt headers.
-    // Until we do, we instead accept the Chat-Verified header as indication all contacts are verified.
-    // TODO: Ignore ChatVerified header once we reset existing verifications.
-    let chat_verified = mimeparser.get_header(HeaderDef::ChatVerified).is_some();
-
-    for gossiped_key in mimeparser
-        .gossiped_keys
-        .values()
-        .filter(|gossiped_key| gossiped_key.verified || chat_verified)
-    {
-        let fingerprint = gossiped_key.public_key.dc_fingerprint().hex();
-        let Some(to_id) = lookup_key_contact_by_fingerprint(context, &fingerprint).await? else {
-            continue;
-        };
-
-        if to_id == ContactId::SELF || to_id == from_id {
-            continue;
-        }
-
-        mark_contact_id_as_verified(context, to_id, verifier_id).await?;
-    }
-
-    Ok(())
-}
-
 /// Returns the last message referenced from `References` header if it is in the database.
 ///
 /// For Delta Chat messages it is the last message in the chat of the sender.
@@ -4121,7 +4033,7 @@ async fn add_or_lookup_contacts_by_address_list(
 async fn add_or_lookup_key_contacts(
     context: &Context,
     address_list: &[SingleInfo],
-    gossiped_keys: &BTreeMap<String, GossipedKey>,
+    gossiped_keys: &BTreeMap<String, SignedPublicKey>,
     fingerprints: &[Fingerprint],
     origin: Origin,
 ) -> Result<Vec<Option<ContactId>>> {
@@ -4138,7 +4050,7 @@ async fn add_or_lookup_key_contacts(
             // Iterator has not ran out of fingerprints yet.
             fp.hex()
         } else if let Some(key) = gossiped_keys.get(addr) {
-            key.public_key.dc_fingerprint().hex()
+            key.dc_fingerprint().hex()
         } else if context.is_self_addr(addr).await? {
             contact_ids.push(Some(ContactId::SELF));
             continue;

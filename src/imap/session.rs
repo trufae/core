@@ -99,21 +99,12 @@ impl Session {
         self.capabilities.can_idle
     }
 
-    pub fn can_move(&self) -> bool {
-        self.capabilities.can_move
-    }
-
     pub fn can_check_quota(&self) -> bool {
         self.capabilities.can_check_quota
     }
 
     pub fn can_metadata(&self) -> bool {
         self.capabilities.can_metadata
-    }
-
-    // Returns true if IMAP server has `XCHATMAIL` capability.
-    pub(crate) fn is_chatmail(&self) -> bool {
-        self.capabilities.is_chatmail
     }
 
     /// Prefetch `n_uids` messages starting from `uid_next`. Returns a list of fetch results in the

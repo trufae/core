@@ -98,7 +98,8 @@ pub trait DcKey: Serialize + Deserializable + Clone {
         // Because we write to a Vec<u8> the io::Write impls never
         // fail and we can hide this error.
         let mut buf = Vec::new();
-        self.to_writer(&mut buf).unwrap();
+        self.to_writer(&mut buf)
+            .expect("Writing to Vec<u8> cannot fail");
         buf
     }
 
@@ -124,14 +125,11 @@ pub trait DcKey: Serialize + Deserializable + Clone {
 
 /// Converts secret key to public key.
 pub(crate) fn secret_key_to_public_key(
-    context: &Context,
     mut signed_secret_key: SignedSecretKey,
     timestamp: u32,
     addr: &str,
     relay_addrs: &str,
 ) -> Result<SignedPublicKey> {
-    info!(context, "Converting secret key to public key.");
-
     // Make sure timestamp of created signatures
     // is not in the past compared to the primary key timestamp.
     let timestamp = std::cmp::max(
@@ -304,7 +302,7 @@ pub(crate) async fn load_self_public_key_opt(context: &Context) -> Result<Option
     let addr = context.get_primary_self_addr().await?;
     let all_addrs = context.get_self_addrs().await?.join(",");
     let signed_public_key =
-        secret_key_to_public_key(context, signed_secret_key, timestamp, &addr, &all_addrs)?;
+        secret_key_to_public_key(signed_secret_key, timestamp, &addr, &all_addrs)?;
     *lock = Some(signed_public_key.clone());
 
     Ok(Some(signed_public_key))
@@ -662,6 +660,7 @@ mod tests {
     use crate::config::Config;
     use crate::test_utils::{TestContext, TestContextManager, alice_keypair};
     use crate::tools::SystemTime;
+    use crate::transport::add_pseudo_transport;
 
     static KEYPAIR: LazyLock<SignedSecretKey> = LazyLock::new(alice_keypair);
 
@@ -811,6 +810,7 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_load_self_generate_public() {
         let t = TestContext::new().await;
+        add_pseudo_transport(&t, "alice@example.org").await.unwrap();
         t.set_config(Config::ConfiguredAddr, Some("alice@example.org"))
             .await
             .unwrap();
@@ -821,6 +821,7 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_load_self_generate_secret() {
         let t = TestContext::new().await;
+        add_pseudo_transport(&t, "alice@example.org").await.unwrap();
         t.set_config(Config::ConfiguredAddr, Some("alice@example.org"))
             .await
             .unwrap();
@@ -833,6 +834,7 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
         use std::thread;
 
         let t = TestContext::new().await;
+        add_pseudo_transport(&t, "alice@example.org").await.unwrap();
         t.set_config(Config::ConfiguredAddr, Some("alice@example.org"))
             .await
             .unwrap();

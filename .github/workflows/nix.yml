@@ -5,11 +5,13 @@ on:
     paths:
       - flake.nix
       - flake.lock
+      - nix/**
       - .github/workflows/nix.yml
   push:
     paths:
       - flake.nix
       - flake.lock
+      - nix/**
       - .github/workflows/nix.yml
     branches:
       - main
@@ -25,8 +27,8 @@ jobs:
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
-      - run: nix fmt flake.nix -- --check
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - run: nix fmt flake.nix nix/ -- --check
 
   build:
     name: nix build
@@ -83,7 +85,7 @@ jobs:
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - run: nix build .#${{ matrix.installable }}
 
   build-macos:
@@ -104,5 +106,5 @@ jobs:
         with:
           show-progress: false
           persist-credentials: false
-      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - run: nix build .#${{ matrix.installable }}

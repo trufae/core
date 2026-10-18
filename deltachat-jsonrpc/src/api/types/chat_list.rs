@@ -11,6 +11,8 @@ use num_traits::cast::ToPrimitive;
 use serde::Serialize;
 use typescript_type_def::TypeDef;
 
+use crate::api::types::contact::ContactFreshness;
+
 use super::chat::JsonrpcChatType;
 use super::color_int_to_hex_string;
 use super::message::MessageViewtype;
@@ -29,8 +31,6 @@ pub enum ChatListItemFetchResult {
         summary_text1: String,
         summary_text2: String,
         summary_status: u32,
-        /// showing preview if last chat message is image
-        summary_preview_image: Option<String>,
 
         /// True if the chat is encrypted.
         /// This means that all messages in the chat are encrypted,
@@ -68,7 +68,7 @@ pub enum ChatListItemFetchResult {
         is_contact_request: bool,
         /// contact id if this is a dm chat (for view profile entry in context menu)
         dm_chat_contact: Option<u32>,
-        was_seen_recently: bool,
+        freshness: ContactFreshness,
         last_message_type: Option<MessageViewtype>,
         last_message_id: Option<u32>,
     },
@@ -101,8 +101,6 @@ pub(crate) async fn get_chat_list_item_by_id(
     let summary_text1 = summary.prefix.map_or_else(String::new, |s| s.to_string());
     let summary_text2 = summary.text.to_owned();
 
-    let summary_preview_image = summary.thumbnail_path;
-
     let visibility = chat.get_visibility();
 
     let avatar_path = chat
@@ -127,22 +125,20 @@ pub(crate) async fn get_chat_list_item_by_id(
         None => (None, None),
     };
 
-    let (dm_chat_contact, was_seen_recently) = if chat.get_type() == Chattype::Single {
+    let (dm_chat_contact, freshness) = if chat.get_type() == Chattype::Single {
         let chat_contacts = get_chat_contacts(ctx, chat_id).await?;
         let contact = chat_contacts.first();
-        let was_seen_recently = match contact {
+        let freshness = match contact {
             Some(contact) => Contact::get_by_id(ctx, *contact)
                 .await
                 .context("contact")?
-                .was_seen_recently(),
-            None => false,
+                .get_freshness()
+                .into(),
+            None => ContactFreshness::Normal,
         };
-        (
-            contact.map(|contact_id| contact_id.to_u32()),
-            was_seen_recently,
-        )
+        (contact.map(|contact_id| contact_id.to_u32()), freshness)
     } else {
-        (None, false)
+        (None, ContactFreshness::Normal)
     };
 
     let color = color_int_to_hex_string(chat.get_color(ctx).await?);
@@ -157,7 +153,6 @@ pub(crate) async fn get_chat_list_item_by_id(
         summary_text1,
         summary_text2,
         summary_status: summary.state.to_u32().expect("impossible"), // idea and a function to transform the constant to strings? or return string enum
-        summary_preview_image,
         is_encrypted: chat.is_encrypted(ctx).await?,
         is_group: chat.get_type() == Chattype::Group,
         fresh_message_counter,
@@ -170,7 +165,7 @@ pub(crate) async fn get_chat_list_item_by_id(
         is_muted: chat.is_muted(),
         is_contact_request: chat.is_contact_request(),
         dm_chat_contact,
-        was_seen_recently,
+        freshness,
         last_message_type: message_type,
         last_message_id: last_msgid.map(|id| id.to_u32()),
     })

@@ -15,7 +15,8 @@
     clippy::explicit_iter_loop,
     clippy::explicit_into_iter_loop,
     clippy::cloned_instead_of_copied,
-    clippy::manual_is_variant_and
+    clippy::manual_is_variant_and,
+    clippy::unnecessary_wraps
 )]
 #![cfg_attr(not(test), warn(clippy::arithmetic_side_effects))]
 #![cfg_attr(not(test), forbid(clippy::indexing_slicing))]
@@ -97,7 +98,7 @@ pub mod stock_str;
 pub mod storage_usage;
 mod sync;
 mod token;
-mod transport;
+pub mod transport;
 mod update_helper;
 pub mod webxdc;
 #[macro_use]

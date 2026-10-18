@@ -33,9 +33,6 @@ pub enum EventType {
     /// Emitted when an IMAP message has been marked as deleted
     ImapMessageDeleted(String),
 
-    /// Emitted when an IMAP message has been moved
-    ImapMessageMoved(String),
-
     /// Emitted before going into IDLE on the Inbox folder.
     ImapInboxIdle,
 
@@ -94,6 +91,14 @@ pub enum EventType {
 
         /// ID of the contact whose reaction set is changed. May be 0 eg. in case of broadcasted reactions.
         contact_id: ContactId,
+    },
+
+    /// The list of pinned messages for the chat has changed.
+    ///
+    /// Some message got pinned, or pinned message is unpinned or deleted.
+    PinnedMessagesChanged {
+        /// ID of the chat where the list of pinned messages changed.
+        chat_id: ChatId,
     },
 
     /// A reaction to one's own sent message received.
@@ -214,7 +219,6 @@ pub enum EventType {
     },
 
     /// Chat changed.  The name or the image of a chat group was changed or members were added or removed.
-    /// Or the verify state of a chat has changed.
     /// See dc_set_chat_name(), dc_set_chat_profile_image(), dc_add_contact_to_chat()
     /// and dc_remove_contact_from_chat().
     ///
@@ -302,8 +306,7 @@ pub enum EventType {
         contact_id: ContactId,
 
         /// Progress as:
-        /// 400=vg-/vc-request-with-auth sent, typically shown as "alice@addr verified, introducing myself."
-        /// (Bob has verified alice and waits until Alice does the same for him)
+        /// 400=vg-/vc-request-with-auth sent, typically shown as "introducing myself."
         /// 1000=vg-member-added/vc-contact-confirm received
         progress: u16,
     },
@@ -357,11 +360,18 @@ pub enum EventType {
         msg_id: MsgId,
     },
 
-    /// Tells that the Background fetch was completed (or timed out).
-    /// This event acts as a marker, when you reach this event you can be sure
-    /// that all events emitted during the background fetch were processed.
+    /// Tells that a background fetch call is done:
+    /// the fetch completed, timed out, was stopped or was not started.
     ///
-    /// This event is only emitted by the account manager
+    /// For the call that started the fetch, this event acts as a marker:
+    /// all events emitted during the fetch were processed once it is reached.
+    /// A call made while another background fetch is running gets the event immediately,
+    /// and the running fetch keeps emitting events until its own marker.
+    ///
+    /// The event carries no data identifying the call it belongs to,
+    /// so it is unambiguous only if there are no concurrent background fetch calls.
+    ///
+    /// This event is only emitted by the account manager.
     AccountsBackgroundFetchDone,
     /// Inform that set of chats or the order of the chats in the chatlist has changed.
     ///
@@ -429,7 +439,7 @@ pub enum EventType {
         chat_id: ChatId,
     },
 
-    /// One or more transports has changed or another transport is primary now.
+    /// One or more transports has changed or another transport is used for sending now.
     ///
     /// UI should update the list.
     ///

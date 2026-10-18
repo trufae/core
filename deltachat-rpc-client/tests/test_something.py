@@ -35,6 +35,19 @@ def test_sleep(rpc) -> None:
         assert sleep_5_future in pending
 
 
+def test_shutdown(rpc) -> None:
+    """Test RPC client shutdown if RPC server process is terminated.
+
+    This is a regression test, at the time of adding it RPC client
+    did not terminate all threads and python process did not exit.
+    Shutting down all threads is tested implicitly by pytest-timeout.
+    """
+    rpc.process.kill()
+    rpc.process.wait()
+    with pytest.raises(JsonRpcError):
+        rpc.get_system_info()
+
+
 def test_email_address_validity(rpc) -> None:
     valid_addresses = [
         "email@example.com",
@@ -155,7 +168,7 @@ def test_list_transports(acf) -> None:
 def test_account(acf) -> None:
     alice, bob = acf.get_online_accounts(2)
 
-    bob_addr = bob.get_config("addr")
+    bob_addr = bob.get_config("configured_addr")
     alice_contact_bob = alice.create_contact(bob, "Bob")
     alice_chat_bob = alice_contact_bob.create_chat()
     alice_chat_bob.send_text("Hello!")
@@ -318,7 +331,7 @@ def test_chat(acf) -> None:
 def test_contact(acf) -> None:
     alice, bob = acf.get_online_accounts(2)
 
-    bob_addr = bob.get_config("addr")
+    bob_addr = bob.get_config("configured_addr")
     alice_contact_bob = alice.create_contact(bob, "Bob")
 
     assert alice_contact_bob == alice.get_contact_by_id(alice_contact_bob.id)
@@ -421,7 +434,6 @@ def test_dont_move_sync_msgs(acf, direct_imap):
     addr, password = acf.get_credentials()
     ac1 = acf.get_unconfigured_account()
     ac1.set_config("bcc_self", "1")
-    ac1.set_config("fix_is_chatmail", "1")
     ac1.add_or_update_transport({"addr": addr, "password": password})
     ac1.start_io()
     ac1_direct_imap = direct_imap(ac1)
@@ -605,7 +617,6 @@ def test_import_export_online_all(acf, tmp_path, rpcdata, log) -> None:
     (ac1, some1) = acf.get_online_accounts(2)
 
     log.section("create some chat content")
-    some1_addr = some1.get_config("addr")
     chat1 = ac1.create_contact(some1).create_chat()
     chat1.send_text("msg1")
     assert len(ac1.get_contacts()) == 1
@@ -623,7 +634,6 @@ def test_import_export_online_all(acf, tmp_path, rpcdata, log) -> None:
         contacts = ac.get_contacts()
         assert len(contacts) == 1
         contact2 = contacts[0]
-        assert contact2.get_snapshot().address == some1_addr
         chat2 = contact2.create_chat()
         messages = chat2.get_messages()
         assert len(messages) == 3 + E2EE_INFO_MSGS
@@ -1188,7 +1198,6 @@ def test_leave_broadcast(acf, all_devices_online):
 
     def check_account(ac, contact, inviter_side, please_wait_info_msg=False):
         chat = get_broadcast(ac)
-        contact_snapshot = contact.get_snapshot()
         chat_msgs = chat.get_messages()
 
         encrypted_msg = chat_msgs.pop(0).get_snapshot()
@@ -1200,14 +1209,11 @@ def test_leave_broadcast(acf, all_devices_online):
             assert "invited you to join this channel" in first_msg.text
             assert first_msg.is_info
 
-        member_added_msg = chat_msgs.pop(0).get_snapshot()
-        if inviter_side:
-            assert member_added_msg.text == f"Member {contact_snapshot.display_name} added."
-        else:
-            assert member_added_msg.text == "You joined the channel."
-        assert member_added_msg.is_info
-
         if not inviter_side:
+            member_added_msg = chat_msgs.pop(0).get_snapshot()
+            assert member_added_msg.text == "You joined the channel."
+            assert member_added_msg.is_info
+
             leave_msg = chat_msgs.pop(0).get_snapshot()
             assert leave_msg.text == "You left the channel."
 
@@ -1354,6 +1360,22 @@ def test_background_fetch(acf, dc):
             break
 
 
+def test_background_fetch_does_not_wait_for_sending(dc, acf):
+    alice, bob = acf.get_online_accounts(2)
+    alice_chat_bob = alice.create_chat(bob)
+
+    alice.stop_io()
+    text = "x" * 200_000
+    for _ in range(50):
+        alice_chat_bob.send_text(text)
+    assert not dc.is_sending_finished()
+
+    alice.start_io()
+    dc.background_fetch(50)
+    dc.wait_for_event(EventType.ACCOUNTS_BACKGROUND_FETCH_DONE)
+    assert not dc.is_sending_finished()
+
+
 def test_message_exists(acf):
     ac1, ac2 = acf.get_online_accounts(2)
     chat = ac1.create_chat(ac2)
@@ -1435,3 +1457,35 @@ def test_large_message(acf, rpcdata) -> None:
     assert msg.id == msgs_changed_event.msg_id
     snapshot = msg.get_snapshot()
     assert snapshot.text == "Hello World, this message is bigger than 5 bytes"
+
+
+def test_is_sending_finished(dc, acf) -> None:
+    alice, bob = acf.get_online_accounts(2)
+
+    alice_chat_bob = alice.create_chat(bob)
+    bob_chat_alice = bob.create_chat(alice)
+
+    assert dc.is_sending_finished()
+
+    alice_chat_bob.send_text("Hello!")
+    alice.wait_for_event(EventType.SMTP_MESSAGE_SENT)
+
+    assert dc.is_sending_finished()
+
+    alice.stop_io()
+    bob.stop_io()
+
+    bob_chat_alice.send_text("Hello back!")
+    alice_chat_bob.send_text("Hello again!")
+
+    assert not dc.is_sending_finished()
+
+    alice.start_io()
+    alice.wait_for_event(EventType.SMTP_MESSAGE_SENT)
+
+    assert not dc.is_sending_finished()
+
+    bob.start_io()
+    bob.wait_for_event(EventType.SMTP_MESSAGE_SENT)
+
+    assert dc.is_sending_finished()

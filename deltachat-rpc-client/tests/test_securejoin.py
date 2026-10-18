@@ -1,13 +1,13 @@
 import logging
+import time
 
 import pytest
 
 from deltachat_rpc_client import Chat, EventType, SpecialContactId
 from deltachat_rpc_client.const import ChatType
-from deltachat_rpc_client.rpc import JsonRpcError
 
 
-def test_qr_setup_contact(acf, tmp_path) -> None:
+def test_qr_setup_contact(acf) -> None:
     alice, bob = acf.get_online_accounts(2)
 
     qr_code = alice.get_qr_code()
@@ -15,38 +15,20 @@ def test_qr_setup_contact(acf, tmp_path) -> None:
 
     alice.wait_for_securejoin_inviter_success()
 
-    # Test that Alice verified Bob's profile.
     alice_contact_bob = alice.create_contact(bob)
     alice_contact_bob_snapshot = alice_contact_bob.get_snapshot()
-    assert alice_contact_bob_snapshot.is_verified
+    assert alice_contact_bob_snapshot.e2ee_avail
 
     bob.wait_for_securejoin_joiner_success()
 
-    # Test that Bob verified Alice's profile.
     bob_contact_alice = bob.create_contact(alice)
     bob_contact_alice_snapshot = bob_contact_alice.get_snapshot()
-    assert bob_contact_alice_snapshot.is_verified
-
-    # Test that if Bob imports a key,
-    # backwards verification is not lost
-    # because default key is not changed.
-    logging.info("Bob 2 is created")
-    bob2 = acf.new_configured_account()
-    bob2.export_self_keys(tmp_path)
-
-    logging.info("Bob tries to import a key")
-    # Importing a second key is not allowed.
-    with pytest.raises(JsonRpcError):
-        bob.import_self_keys(tmp_path)
-
-    assert bob.get_config("key_id") == "1"
-    bob_contact_alice_snapshot = bob_contact_alice.get_snapshot()
-    assert bob_contact_alice_snapshot.is_verified
+    assert bob_contact_alice_snapshot.e2ee_avail
 
 
 def test_qr_setup_contact_svg(acf) -> None:
     alice = acf.new_configured_account()
-    _, _, domain = alice.get_config("addr").rpartition("@")
+    _, _, domain = alice.list_transports()[0]["addr"].rpartition("@")
 
     _qr_code, svg = alice.get_qr_code_svg()
 
@@ -62,6 +44,7 @@ def test_qr_setup_contact_svg(acf) -> None:
 def test_qr_securejoin(acf):
     alice, bob, fiona = acf.get_online_accounts(3)
 
+    alice.set_config("displayname", "Alice")
     # Setup second device for Alice
     # to test observing securejoin protocol.
     alice2 = alice.clone()
@@ -81,26 +64,24 @@ def test_qr_securejoin(acf):
         ac.wait_for_event(EventType.IMAP_MESSAGE_DELETED)
     bob.wait_for_securejoin_joiner_success()
 
-    # Test that Alice verified Bob's profile.
     alice_contact_bob = alice.create_contact(bob)
     alice_contact_bob_snapshot = alice_contact_bob.get_snapshot()
-    assert alice_contact_bob_snapshot.is_verified
+    assert alice_contact_bob_snapshot.e2ee_avail
 
     snapshot = bob.wait_for_incoming_msg().get_snapshot()
-    assert snapshot.text == "You were added by {}.".format(alice.get_config("addr"))
+    assert snapshot.text == "You were added by Alice."
 
-    # Test that Bob verified Alice's profile.
     bob_contact_alice = bob.create_contact(alice)
     bob_contact_alice_snapshot = bob_contact_alice.get_snapshot()
-    assert bob_contact_alice_snapshot.is_verified
+    assert bob_contact_alice_snapshot.e2ee_avail
 
     # Start second Alice device.
-    # Alice observes securejoin protocol and verifies Bob on second device.
+    # Alice observes the securejoin protocol on the second device.
     alice2.start_io()
     alice2.wait_for_securejoin_inviter_success()
     alice2_contact_bob = alice2.create_contact(bob)
     alice2_contact_bob_snapshot = alice2_contact_bob.get_snapshot()
-    assert alice2_contact_bob_snapshot.is_verified
+    assert alice2_contact_bob_snapshot.e2ee_avail
 
     # The QR code token is synced, so alice2 must be able to handle join requests.
     logging.info("Fiona joins the group via alice2")
@@ -108,6 +89,30 @@ def test_qr_securejoin(acf):
     fiona.secure_join(qr_code)
     alice2.wait_for_securejoin_inviter_success()
     fiona.wait_for_securejoin_joiner_success()
+
+
+def test_qr_securejoin_request_deleted_on_all_transports(acf):
+    alice, bob = acf.get_online_accounts(2)
+    alice.add_transport_from_qr(acf.get_account_qr())
+    alice.bring_online()
+    alice_chat = alice.create_group("Group")
+    qr_code = alice_chat.get_qr_code()
+    alice2 = alice.clone()
+
+    bob.secure_join(qr_code)
+    alice.wait_for_securejoin_inviter_success()
+    alice_chat.remove_contact(bob)
+    # Stop and start io in order to wait until the remove message is sent out.
+    alice.stop_io()
+    alice.bring_online()
+
+    # Membership timestamps have a resolution of one second.
+    time.sleep(1)
+    # By now, the securejoin message sent by Bob must be deleted on Alice's relays.
+    # Otherwise, alice2 would execute securejoin again and re-add Bob.
+    alice2.bring_online()
+    alice2_chat = alice2.get_chat_by_id(alice_chat.id)
+    assert alice2.create_contact(bob) not in alice2_chat.get_contacts()
 
 
 @pytest.mark.parametrize("all_devices_online", [True, False])
@@ -151,9 +156,9 @@ def test_qr_securejoin_broadcast(acf, all_devices_online):
         assert snapshot2.chat_id == chat.id
 
     def check_account(ac, contact, inviter_side, please_wait_info_msg=False):
-        # Check that the chat partner is verified.
+        # Check that the chat partner's key is known.
         contact_snapshot = contact.get_snapshot()
-        assert contact_snapshot.is_verified
+        assert contact_snapshot.e2ee_avail
 
         chat = get_broadcast(ac)
         chat_msgs = chat.get_messages()
@@ -167,17 +172,13 @@ def test_qr_securejoin_broadcast(acf, all_devices_online):
             assert "invited you to join this channel" in first_msg.text
             assert first_msg.is_info
 
-        if inviter_side:
-            member_added_msg = chat_msgs.pop(0).get_snapshot()
-            assert member_added_msg.text == f"Member {contact_snapshot.display_name} added."
-            assert member_added_msg.info_contact_id == contact_snapshot.id
-        else:
+        if not inviter_side:
             if chat_msgs[0].get_snapshot().text == "You joined the channel.":
                 member_added_msg = chat_msgs.pop(0).get_snapshot()
             else:
                 member_added_msg = chat_msgs.pop(1).get_snapshot()
                 assert member_added_msg.text == "You joined the channel."
-        assert member_added_msg.is_info
+            assert member_added_msg.is_info
 
         hello_msg = chat_msgs.pop(0).get_snapshot()
         assert hello_msg.text == "Hello everyone!"
@@ -242,7 +243,7 @@ def test_qr_securejoin_broadcast(acf, all_devices_online):
     snapshot = fiona.wait_for_incoming_msg().get_snapshot()
     assert snapshot.text == "You joined the channel."
 
-    get_broadcast(alice2).get_messages()[2].resend()
+    get_broadcast(alice2).get_messages()[1].resend()
     snapshot = fiona.wait_for_incoming_msg().get_snapshot()
     assert snapshot.text == "Hello everyone!"
 
@@ -350,8 +351,8 @@ def test_setup_contact_resetup(acf) -> None:
     bob.wait_for_securejoin_joiner_success()
 
 
-def test_verified_group_member_added_recovery(acf) -> None:
-    """Tests verified group recovery by reverifying then removing and adding a member back."""
+def test_group_member_added_recovery(acf) -> None:
+    """Tests group recovery after a member resets its key."""
     ac1, ac2, ac3 = acf.get_online_accounts(3)
 
     logging.info("ac1 creates a group")
@@ -362,11 +363,7 @@ def test_verified_group_member_added_recovery(acf) -> None:
     ac2.secure_join(qr_code)
     ac2.wait_for_securejoin_joiner_success()
 
-    # ac1 has ac2 directly verified.
-    ac1_contact_ac2 = ac1.create_contact(ac2)
-    assert ac1_contact_ac2.get_snapshot().verifier_id == SpecialContactId.SELF
-
-    logging.info("ac3 joins verified group")
+    logging.info("ac3 joins the group")
     ac3_chat = ac3.secure_join(qr_code)
     ac3.wait_for_securejoin_joiner_success()
     ac3.wait_for_incoming_msg_event()  # Member added
@@ -376,7 +373,7 @@ def test_verified_group_member_added_recovery(acf) -> None:
     logging.info("ac2 logs in on a new device")
     ac2 = acf.resetup_account(ac2)
 
-    logging.info("ac2 reverifies with ac3")
+    logging.info("ac2 scans ac3's QR code again")
     qr_code = ac3.get_qr_code()
     ac2.secure_join(qr_code)
     ac2.wait_for_securejoin_joiner_success()
@@ -416,14 +413,6 @@ def test_verified_group_member_added_recovery(acf) -> None:
     snapshot = ac1.wait_for_incoming_msg().get_snapshot()
     assert snapshot.text == "Works again!"
 
-    ac1_contact_ac2 = ac1.create_contact(ac2)
-    ac1_contact_ac3 = ac1.create_contact(ac3)
-    ac1_contact_ac2_snapshot = ac1_contact_ac2.get_snapshot()
-    # Until we reset verifications and then send the _verified header,
-    # verification is not gossiped here:
-    assert not ac1_contact_ac2_snapshot.is_verified
-    assert ac1_contact_ac2_snapshot.verifier_id != ac1_contact_ac3.id
-
 
 def test_qr_join_chat_with_pending_bobstate_issue4894(acf):
     """Regression test for
@@ -431,13 +420,13 @@ def test_qr_join_chat_with_pending_bobstate_issue4894(acf):
     """
     ac1, ac2, ac3, ac4 = acf.get_online_accounts(4)
 
-    logging.info("ac3: verify with ac2")
+    logging.info("ac3: set up contact with ac2")
     qr_code = ac2.get_qr_code()
     ac3.secure_join(qr_code)
     ac2.wait_for_securejoin_inviter_success()
 
-    # in order for ac2 to have pending bobstate with a verified group
-    # we first create a fully joined verified group, and then start
+    # in order for ac2 to have pending bobstate with a group
+    # we first create a fully joined group, and then start
     # joining a second time but interrupt it, to create pending bob state
 
     logging.info("ac1: create a group that ac2 fully joins")
@@ -446,7 +435,7 @@ def test_qr_join_chat_with_pending_bobstate_issue4894(acf):
     ac2.secure_join(qr_code)
     ac1.wait_for_securejoin_inviter_success()
 
-    # ensure ac1 can write and ac2 receives messages in verified chat
+    # ensure ac1 can write and ac2 receives messages in the chat
     ch1.send_text("ac1 says hello")
     while 1:
         snapshot = ac2.wait_for_incoming_msg().get_snapshot()
@@ -459,11 +448,11 @@ def test_qr_join_chat_with_pending_bobstate_issue4894(acf):
     ac1.remove()
     logging.info("ac2 now has pending bobstate but ac1 is shutoff")
 
-    # we meanwhile expect ac3/ac2 verification started in the beginning to have completed
-    assert ac3.create_contact(ac2).get_snapshot().is_verified
-    assert ac2.create_contact(ac3).get_snapshot().is_verified
+    # we meanwhile expect the ac3/ac2 setup-contact started in the beginning to have completed
+    assert ac3.create_contact(ac2).get_snapshot().e2ee_avail
+    assert ac2.create_contact(ac3).get_snapshot().e2ee_avail
 
-    logging.info("ac3: create a verified group VG with ac2")
+    logging.info("ac3: create a group VG with ac2")
     vg = ac3.create_group("ac3-created")
     vg.add_contact(ac3.create_contact(ac2))
 
@@ -486,7 +475,7 @@ def test_qr_join_chat_with_pending_bobstate_issue4894(acf):
 
 def test_qr_new_group_unblocked(acf):
     """Regression test for a bug introduced in core v1.113.0.
-    ac2 scans a verified group QR code created by ac1.
+    ac2 scans a group QR code created by ac1.
     This results in creation of a blocked single chat with ac1 on ac2,
     but ac1 contact is not blocked on ac2.
     Then ac1 creates a group, adds ac2 there and promotes it by sending a message.
@@ -513,13 +502,13 @@ def test_qr_new_group_unblocked(acf):
 
 
 @pytest.mark.skip(reason="AEAP is disabled for now")
-def test_aeap_flow_verified(acf):
+def test_aeap_flow(acf):
     """Test that a new address is added to a contact when it changes its address."""
     ac1, ac2 = acf.get_online_accounts(2)
 
     addr, password = acf.get_credentials()
 
-    logging.info("ac1: create verified-group QR, ac2 scans and joins")
+    logging.info("ac1: create group QR, ac2 scans and joins")
     chat = ac1.create_group("hello")
     qr_code = chat.get_qr_code()
     logging.info("ac2: start QR-code based join-group protocol")
@@ -536,11 +525,9 @@ def test_aeap_flow_verified(acf):
     assert msg_in_1.text == msg_out.text
 
     logging.info("changing email account")
-    ac1.set_config("addr", addr)
-    ac1.set_config("mail_pw", password)
-    ac1.stop_io()
-    ac1.configure()
-    ac1.start_io()
+    old_addr = ac1.list_transports()[0]["addr"]
+    ac1.add_transport_from_qr(acf.get_account_qr())
+    ac1.delete_transport(old_addr)
 
     logging.info("sending second message")
     msg_out = chat.send_text("changed address").get_snapshot()
@@ -555,65 +542,16 @@ def test_aeap_flow_verified(acf):
     assert addr in [contact.get_snapshot().address for contact in msg_in_2_snapshot.chat.get_contacts()]
 
 
-def test_gossip_verification(acf) -> None:
-    alice, bob, carol = acf.get_online_accounts(3)
-
-    # Bob verifies Alice.
-    qr_code = alice.get_qr_code()
-    bob.secure_join(qr_code)
-    bob.wait_for_securejoin_joiner_success()
-
-    # Bob verifies Carol.
-    qr_code = carol.get_qr_code()
-    bob.secure_join(qr_code)
-    bob.wait_for_securejoin_joiner_success()
-
-    bob_contact_alice = bob.create_contact(alice, "Alice")
-    bob_contact_carol = bob.create_contact(carol, "Carol")
-    carol_contact_alice = carol.create_contact(alice, "Alice")
-
-    logging.info("Bob creates an Autocrypt group")
-    bob_group_chat = bob.create_group("Autocrypt Group")
-    bob_group_chat.add_contact(bob_contact_alice)
-    bob_group_chat.add_contact(bob_contact_carol)
-    bob_group_chat.send_message(text="Hello Autocrypt group")
-
-    snapshot = carol.wait_for_incoming_msg().get_snapshot()
-    assert snapshot.text == "Hello Autocrypt group"
-    assert snapshot.show_padlock
-
-    # Group propagates verification using Autocrypt-Gossip header.
-    carol_contact_alice_snapshot = carol_contact_alice.get_snapshot()
-    # Until we reset verifications and then send the _verified header,
-    # verification is not gossiped here:
-    assert not carol_contact_alice_snapshot.is_verified
-
-    logging.info("Bob creates a Securejoin group")
-    bob_group_chat = bob.create_group("Securejoin Group")
-    bob_group_chat.add_contact(bob_contact_alice)
-    bob_group_chat.add_contact(bob_contact_carol)
-    bob_group_chat.send_message(text="Hello Securejoin group")
-
-    snapshot = carol.wait_for_incoming_msg().get_snapshot()
-    assert snapshot.text == "Hello Securejoin group"
-    assert snapshot.show_padlock
-
-    # Securejoin propagates verification.
-    carol_contact_alice_snapshot = carol_contact_alice.get_snapshot()
-    # Until we reset verifications and then send the _verified header,
-    # verification is not gossiped here:
-    assert not carol_contact_alice_snapshot.is_verified
-
-
 def test_securejoin_after_contact_resetup(acf) -> None:
     """
-    Regression test for a bug that prevented joining verified group with a QR code
-    if the group is already created and contains
-    a contact with inconsistent (Autocrypt and verified keys exist but don't match) key state.
+    Regression test for a bug that prevented joining a group with a QR code
+    if the group already contains a contact with the same address as the inviter,
+    but different key fingerprint while a securejoin with that contact is still pending.
     """
     ac1, ac2, ac3 = acf.get_online_accounts(3)
+    ac3.set_config("displayname", "ac3")
 
-    # ac3 creates protected group with ac1.
+    # ac3 creates a group with ac1.
     ac3_chat = ac3.create_group("Group")
 
     # ac1 joins ac3 group.
@@ -623,31 +561,27 @@ def test_securejoin_after_contact_resetup(acf) -> None:
 
     # ac1 waits for member added message and creates a QR code.
     snapshot = ac1.wait_for_incoming_msg().get_snapshot()
-    assert snapshot.text == "You were added by {}.".format(ac3.get_config("addr"))
+    assert snapshot.text == "You were added by ac3."
     ac1_qr_code = snapshot.chat.get_qr_code()
 
-    # ac2 verifies ac1
+    # ac2 sets up contact with ac1
     qr_code = ac1.get_qr_code()
     ac2.secure_join(qr_code)
     ac2.wait_for_securejoin_joiner_success()
 
-    # ac1 is verified for ac2.
     ac2_contact_ac1 = ac2.create_contact(ac1, "")
-    assert ac2_contact_ac1.get_snapshot().is_verified
+    assert ac2_contact_ac1.get_snapshot().e2ee_avail
 
     # ac1 resetups the account.
     ac1 = acf.resetup_account(ac1)
-    ac2_contact_ac1 = ac2.create_contact(ac1, "")
-    assert not ac2_contact_ac1.get_snapshot().is_verified
 
     # ac1 goes offline.
     ac1.remove()
 
-    # Scanning a QR code results in creating an unprotected group with an inviter.
-    # In this case inviter is ac1 which has an inconsistent key state.
-    # Normally inviter becomes verified as a result of Securejoin protocol
-    # and then the group chat becomes verified when "Member added" is received,
-    # but in this case ac1 is offline and this Securejoin process will never finish.
+    # Scanning a QR code creates a group with the inviter, here ac1.
+    # Normally the securejoin protocol
+    # would complete and "Member added" would arrive,
+    # but ac1 is offline so it never finishes.
     logging.info("ac2 scans ac1 QR code, this is not expected to finish")
     ac2.secure_join(ac1_qr_code)
 
@@ -664,16 +598,15 @@ def test_securejoin_after_contact_resetup(acf) -> None:
     ac2_chat = snapshot.chat
     assert len(ac2_chat.get_contacts()) == 3
 
-    # ac1 is still "not verified" for ac2 due to inconsistent state.
-    assert not ac2_contact_ac1.get_snapshot().is_verified
-
 
 def test_withdraw_securejoin_qr(acf):
     alice, bob = acf.get_online_accounts(2)
+    alice.set_config("displayname", "Alice")
+    bob.set_config("displayname", "Bob")
 
     logging.info("Alice creates a group")
     alice_chat = alice.create_group("Group")
-    logging.info("Bob joins verified group")
+    logging.info("Bob joins the group")
 
     qr_code = alice_chat.get_qr_code()
     bob_chat = bob.secure_join(qr_code)
@@ -682,11 +615,11 @@ def test_withdraw_securejoin_qr(acf):
     alice.clear_all_events()
 
     snapshot = bob.wait_for_incoming_msg().get_snapshot()
-    assert snapshot.text == "You were added by {}.".format(alice.get_config("addr"))
+    assert snapshot.text == "You were added by Alice."
     bob_chat.leave()
 
     snapshot = alice.get_message_by_id(alice.wait_for_msgs_changed_event().msg_id).get_snapshot()
-    assert snapshot.text == "Group left by {}.".format(bob.get_config("addr"))
+    assert snapshot.text == "Group left by Bob."
 
     logging.info("Alice withdraws QR code.")
     qr = alice.check_qr(qr_code)

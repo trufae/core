@@ -12,7 +12,6 @@
 extern crate human_panic;
 
 use std::collections::BTreeMap;
-use std::convert::TryFrom;
 use std::fmt::Write;
 use std::future::Future;
 use std::mem::ManuallyDrop;
@@ -31,6 +30,7 @@ use deltachat::key::preconfigure_keypair;
 use deltachat::message::MsgId;
 use deltachat::qr_code_generator::{create_qr_svg, generate_backup_qr, get_securejoin_qr_svg};
 use deltachat::stock_str::StockMessage;
+use deltachat::transport::add_pseudo_transport;
 use deltachat::webxdc::StatusUpdateSerial;
 use deltachat::*;
 use deltachat::{accounts::Accounts, log::LogExt};
@@ -46,7 +46,6 @@ mod dc_array;
 mod lot;
 
 mod string;
-use deltachat::chatlist::Chatlist;
 
 use self::string::*;
 
@@ -415,6 +414,21 @@ pub unsafe extern "C" fn dc_configure(context: *mut dc_context_t) {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn dc_add_pseudo_transport(
+    context: *mut dc_context_t,
+    addr: *const libc::c_char,
+) {
+    if context.is_null() {
+        eprintln!("ignoring careless call to dc_add_pseudo_transport()");
+        return;
+    }
+
+    let ctx = unsafe { &*context };
+    let addr = to_string_lossy(addr);
+    block_on(add_pseudo_transport(ctx, &addr)).log_err(ctx).ok();
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dc_is_configured(context: *mut dc_context_t) -> libc::c_int {
     if context.is_null() {
         eprintln!("ignoring careless call to dc_is_configured()");
@@ -477,7 +491,6 @@ pub unsafe extern "C" fn dc_event_get_id(event: *mut dc_event_t) -> libc::c_int 
         EventType::ImapConnected(_) => 102,
         EventType::SmtpMessageSent(_) => 103,
         EventType::ImapMessageDeleted(_) => 104,
-        EventType::ImapMessageMoved(_) => 105,
         EventType::ImapInboxIdle => 106,
         EventType::NewBlobFile(_) => 150,
         EventType::DeletedBlobFile(_) => 151,
@@ -499,6 +512,7 @@ pub unsafe extern "C" fn dc_event_get_id(event: *mut dc_event_t) -> libc::c_int 
         EventType::ChatModified(_) => 2020,
         EventType::ChatEphemeralTimerModified { .. } => 2021,
         EventType::ChatDeleted { .. } => 2023,
+        EventType::PinnedMessagesChanged { .. } => 2024,
         EventType::ContactsChanged(_) => 2030,
         EventType::LocationChanged(_) => 2035,
         EventType::ConfigureProgress { .. } => 2041,
@@ -544,7 +558,6 @@ pub unsafe extern "C" fn dc_event_get_data1_int(event: *mut dc_event_t) -> libc:
         | EventType::ImapConnected(_)
         | EventType::SmtpMessageSent(_)
         | EventType::ImapMessageDeleted(_)
-        | EventType::ImapMessageMoved(_)
         | EventType::ImapInboxIdle
         | EventType::NewBlobFile(_)
         | EventType::DeletedBlobFile(_)
@@ -573,7 +586,8 @@ pub unsafe extern "C" fn dc_event_get_data1_int(event: *mut dc_event_t) -> libc:
         | EventType::MsgReadCountChanged { chat_id, .. }
         | EventType::ChatModified(chat_id)
         | EventType::ChatEphemeralTimerModified { chat_id, .. }
-        | EventType::ChatDeleted { chat_id } => chat_id.to_u32() as libc::c_int,
+        | EventType::ChatDeleted { chat_id }
+        | EventType::PinnedMessagesChanged { chat_id } => chat_id.to_u32() as libc::c_int,
         EventType::ContactsChanged(id) | EventType::LocationChanged(id) => {
             let id = id.unwrap_or_default();
             id.to_u32() as libc::c_int
@@ -619,7 +633,6 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         | EventType::ImapConnected(_)
         | EventType::SmtpMessageSent(_)
         | EventType::ImapMessageDeleted(_)
-        | EventType::ImapMessageMoved(_)
         | EventType::ImapInboxIdle
         | EventType::NewBlobFile(_)
         | EventType::DeletedBlobFile(_)
@@ -648,7 +661,8 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         | EventType::OutgoingCallAccepted { .. }
         | EventType::CallEnded { .. }
         | EventType::EventChannelOverflow { .. }
-        | EventType::TransportsModified => 0,
+        | EventType::TransportsModified
+        | EventType::PinnedMessagesChanged { .. } => 0,
         EventType::MsgsChanged { msg_id, .. }
         | EventType::ReactionsChanged { msg_id, .. }
         | EventType::IncomingReaction { msg_id, .. }
@@ -690,7 +704,7 @@ pub unsafe extern "C" fn dc_event_get_data1_str(event: *mut dc_event_t) -> *mut 
     match event {
         EventType::IncomingWebxdcNotify { href, .. } => {
             if let Some(href) = href {
-                href.to_c_string().unwrap_or_default().into_raw()
+                href.strdup()
             } else {
                 ptr::null_mut()
             }
@@ -714,15 +728,11 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
         | EventType::ImapConnected(msg)
         | EventType::SmtpMessageSent(msg)
         | EventType::ImapMessageDeleted(msg)
-        | EventType::ImapMessageMoved(msg)
         | EventType::NewBlobFile(msg)
         | EventType::DeletedBlobFile(msg)
         | EventType::Warning(msg)
         | EventType::Error(msg)
-        | EventType::ErrorSelfNotInGroup(msg) => {
-            let data2 = msg.to_c_string().unwrap_or_default();
-            data2.into_raw()
-        }
+        | EventType::ErrorSelfNotInGroup(msg) => msg.strdup(),
         EventType::MsgsChanged { .. }
         | EventType::ReactionsChanged { .. }
         | EventType::IncomingMsg { .. }
@@ -753,48 +763,31 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
         | EventType::AccountsItemChanged
         | EventType::IncomingCallAccepted { .. }
         | EventType::WebxdcRealtimeAdvertisementReceived { .. }
-        | EventType::TransportsModified => ptr::null_mut(),
+        | EventType::TransportsModified
+        | EventType::PinnedMessagesChanged { .. } => ptr::null_mut(),
         EventType::IncomingCall {
             place_call_info, ..
-        } => {
-            let data2 = place_call_info.to_c_string().unwrap_or_default();
-            data2.into_raw()
-        }
+        } => place_call_info.strdup(),
         EventType::OutgoingCallAccepted {
             accept_call_info, ..
-        } => {
-            let data2 = accept_call_info.to_c_string().unwrap_or_default();
-            data2.into_raw()
-        }
+        } => accept_call_info.strdup(),
         EventType::CallEnded { .. } | EventType::EventChannelOverflow { .. } => ptr::null_mut(),
         EventType::ConfigureProgress { comment, .. } => {
             if let Some(comment) = comment {
-                comment.to_c_string().unwrap_or_default().into_raw()
+                comment.strdup()
             } else {
                 ptr::null_mut()
             }
         }
-        EventType::ImexFileWritten(file) => {
-            let data2 = file.to_c_string().unwrap_or_default();
-            data2.into_raw()
-        }
-        EventType::ConfigSynced { key } => {
-            let data2 = key.to_string().to_c_string().unwrap_or_default();
-            data2.into_raw()
-        }
+        EventType::ImexFileWritten(file) => file.strdup(),
+        EventType::ConfigSynced { key } => key.to_string().strdup(),
         EventType::WebxdcRealtimeData { data, .. } => {
             let ptr = unsafe { libc::malloc(data.len()) };
             unsafe { libc::memcpy(ptr, data.as_ptr() as *mut libc::c_void, data.len()) };
             ptr as *mut libc::c_char
         }
-        EventType::IncomingReaction { reaction, .. } => reaction
-            .as_str()
-            .to_c_string()
-            .unwrap_or_default()
-            .into_raw(),
-        EventType::IncomingWebxdcNotify { text, .. } => {
-            text.to_c_string().unwrap_or_default().into_raw()
-        }
+        EventType::IncomingReaction { reaction, .. } => reaction.as_str().strdup(),
+        EventType::IncomingWebxdcNotify { text, .. } => text.strdup(),
         #[allow(unreachable_patterns)]
         #[cfg(test)]
         _ => unreachable!("This is just to silence a rust_analyzer false-positive"),
@@ -2418,7 +2411,7 @@ pub unsafe extern "C" fn dc_get_securejoin_qr_svg(
     chat_id: u32,
 ) -> *mut libc::c_char {
     if context.is_null() {
-        eprintln!("ignoring careless call to generate_verification_qr()");
+        eprintln!("ignoring careless call to dc_get_securejoin_qr_svg()");
         return "".strdup();
     }
     let ctx = unsafe { &*context };
@@ -2845,34 +2838,6 @@ pub unsafe extern "C" fn dc_chatlist_get_summary(
     )
     .context("get_summary failed")
     .log_err(&ffi_list.context)
-    .unwrap_or_default();
-    Box::into_raw(Box::new(summary.into()))
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dc_chatlist_get_summary2(
-    context: *mut dc_context_t,
-    chat_id: u32,
-    msg_id: u32,
-) -> *mut dc_lot_t {
-    if context.is_null() {
-        eprintln!("ignoring careless call to dc_chatlist_get_summary2()");
-        return ptr::null_mut();
-    }
-    let ctx = unsafe { &*context };
-    let msg_id = if msg_id == 0 {
-        None
-    } else {
-        Some(MsgId::new(msg_id))
-    };
-    let summary = block_on(Chatlist::get_summary2(
-        ctx,
-        ChatId::new(chat_id),
-        msg_id,
-        None,
-    ))
-    .context("get_summary2 failed")
-    .log_err(ctx)
     .unwrap_or_default();
     Box::into_raw(Box::new(summary.into()))
 }
@@ -3507,6 +3472,7 @@ pub unsafe extern "C" fn dc_msg_get_summary(
     Box::into_raw(Box::new(summary.into()))
 }
 
+// deprecated, use dc_msg_get_summary_text instead
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dc_msg_get_summarytext(
     msg: *mut dc_msg_t,
@@ -3518,14 +3484,37 @@ pub unsafe extern "C" fn dc_msg_get_summarytext(
     }
     let ffi_msg = unsafe { &mut *msg };
 
-    let summary = block_on(ffi_msg.message.get_summary(&ffi_msg.context, None))
-        .context("dc_msg_get_summarytext failed")
-        .log_err(&ffi_msg.context)
-        .unwrap_or_default();
-    match usize::try_from(approx_characters) {
-        Ok(chars) => summary.truncated_text(chars).strdup(),
-        Err(_) => summary.text.strdup(),
+    let add_forwarded = true;
+    let add_type_emoji = true;
+    block_on(ffi_msg.message.get_summary_text_ext(
+        &ffi_msg.context,
+        add_forwarded,
+        add_type_emoji,
+        usize::try_from(approx_characters).unwrap_or_default(),
+    ))
+    .strdup()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dc_msg_get_summary_text(
+    msg: *mut dc_msg_t,
+    add_forwarded: libc::c_int,
+    add_type_emoji: libc::c_int,
+    approx_chars: libc::c_int,
+) -> *mut libc::c_char {
+    if msg.is_null() {
+        eprintln!("ignoring careless call to dc_msg_get_summary_text()");
+        return "".strdup();
     }
+    let ffi_msg = unsafe { &mut *msg };
+
+    block_on(ffi_msg.message.get_summary_text_ext(
+        &ffi_msg.context,
+        add_forwarded != 0,
+        add_type_emoji != 0,
+        usize::try_from(approx_chars).unwrap_or(0),
+    ))
+    .strdup()
 }
 
 #[unsafe(no_mangle)]
@@ -3985,18 +3974,6 @@ pub unsafe extern "C" fn dc_contact_get_display_name(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dc_contact_get_name_n_addr(
-    contact: *mut dc_contact_t,
-) -> *mut libc::c_char {
-    if contact.is_null() {
-        eprintln!("ignoring careless call to dc_contact_get_name_n_addr()");
-        return "".strdup();
-    }
-    let ffi_contact = unsafe { &*contact };
-    ffi_contact.contact.get_name_n_addr().strdup()
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dc_contact_get_profile_image(
     contact: *mut dc_contact_t,
 ) -> *mut libc::c_char {
@@ -4051,13 +4028,13 @@ pub unsafe extern "C" fn dc_contact_get_last_seen(contact: *mut dc_contact_t) ->
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dc_contact_was_seen_recently(contact: *mut dc_contact_t) -> libc::c_int {
+pub unsafe extern "C" fn dc_contact_get_freshness(contact: *mut dc_contact_t) -> libc::c_int {
     if contact.is_null() {
-        eprintln!("ignoring careless call to dc_contact_was_seen_recently()");
+        eprintln!("ignoring careless call to dc_contact_get_freshness()");
         return 0;
     }
     let ffi_contact = unsafe { &*contact };
-    ffi_contact.contact.was_seen_recently() as libc::c_int
+    u32::from(ffi_contact.contact.get_freshness()) as libc::c_int
 }
 
 #[unsafe(no_mangle)]
@@ -4068,27 +4045,6 @@ pub unsafe extern "C" fn dc_contact_is_blocked(contact: *mut dc_contact_t) -> li
     }
     let ffi_contact = unsafe { &*contact };
     ffi_contact.contact.is_blocked() as libc::c_int
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dc_contact_is_verified(contact: *mut dc_contact_t) -> libc::c_int {
-    if contact.is_null() {
-        eprintln!("ignoring careless call to dc_contact_is_verified()");
-        return 0;
-    }
-    let ffi_contact = unsafe { &*contact };
-
-    if block_on(ffi_contact.contact.is_verified(&ffi_contact.context))
-        .context("is_verified failed")
-        .log_err(&ffi_contact.context)
-        .unwrap_or_default()
-    {
-        // Return value is essentially a boolean,
-        // but we return 2 for true for backwards compatibility.
-        2
-    } else {
-        0
-    }
 }
 
 #[unsafe(no_mangle)]
@@ -4109,22 +4065,6 @@ pub unsafe extern "C" fn dc_contact_is_key_contact(contact: *mut dc_contact_t) -
     unsafe { (*contact).contact.is_key_contact() as libc::c_int }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dc_contact_get_verifier_id(contact: *mut dc_contact_t) -> u32 {
-    if contact.is_null() {
-        eprintln!("ignoring careless call to dc_contact_get_verifier_id()");
-        return 0;
-    }
-    let ffi_contact = unsafe { &*contact };
-    let verifier_contact_id = block_on(ffi_contact.contact.get_verifier_id(&ffi_contact.context))
-        .context("failed to get verifier")
-        .log_err(&ffi_contact.context)
-        .unwrap_or_default()
-        .unwrap_or_default()
-        .unwrap_or_default();
-
-    verifier_contact_id.to_u32()
-}
 // dc_lot_t
 
 pub type dc_lot_t = lot::Lot;
@@ -4771,12 +4711,17 @@ pub unsafe extern "C" fn dc_accounts_background_fetch(
     accounts: *const dc_accounts_t,
     timeout_in_seconds: u64,
 ) -> libc::c_int {
-    if accounts.is_null() || timeout_in_seconds <= 2 {
+    if accounts.is_null() {
         eprintln!("ignoring careless call to dc_accounts_background_fetch()");
         return 0;
     }
 
     let accounts = unsafe { &*accounts };
+    if timeout_in_seconds <= 2 {
+        eprintln!("ignoring careless call to dc_accounts_background_fetch(): timeout too small");
+        block_on(accounts.read()).emit_event(EventType::AccountsBackgroundFetchDone);
+        return 0;
+    }
     let background_fetch_future = {
         let lock = block_on(accounts.read());
         lock.background_fetch(Duration::from_secs(timeout_in_seconds))

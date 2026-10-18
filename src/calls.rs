@@ -42,7 +42,7 @@ const RINGING_SECONDS: i64 = 120;
 const CALL_ACCEPTED_TIMESTAMP: Param = Param::Arg;
 const CALL_ENDED_TIMESTAMP: Param = Param::Arg4;
 
-const STUN_PORT: u16 = 3478;
+const TURN_PORT: u16 = 3478;
 
 /// Set if incoming call was ended explicitly
 /// by the other side before we accepted it.
@@ -121,6 +121,45 @@ impl CallInfo {
         self.msg.param.set_i64(CALL_ACCEPTED_TIMESTAMP, time());
         self.msg.update_param(context).await?;
         Ok(())
+    }
+
+    /// Returns call state.
+    pub fn call_state(&self) -> CallState {
+        if self.is_incoming() {
+            if self.is_accepted() {
+                if self.is_ended() {
+                    CallState::Completed {
+                        duration: self.duration_seconds(),
+                    }
+                } else {
+                    CallState::Active
+                }
+            } else if self.is_canceled() {
+                // Call was explicitly canceled
+                // by the caller before we picked it up.
+                CallState::Missed
+            } else if self.is_ended() {
+                CallState::Declined
+            } else if self.is_stale() {
+                CallState::Missed
+            } else {
+                CallState::Alerting
+            }
+        } else if self.is_accepted() {
+            if self.is_ended() {
+                CallState::Completed {
+                    duration: self.duration_seconds(),
+                }
+            } else {
+                CallState::Active
+            }
+        } else if self.is_canceled() {
+            CallState::Canceled
+        } else if self.is_ended() || self.is_stale() {
+            CallState::Declined
+        } else {
+            CallState::Alerting
+        }
     }
 
     /// Returns true if the call is accepted.
@@ -508,10 +547,10 @@ impl Context {
         Ok(self.load_call_by_message(call))
     }
 
-    // Loads information about the call given the `Message`.
-    //
-    // If the `Message` is not a call message, returns `None`
-    fn load_call_by_message(&self, call: Message) -> Option<CallInfo> {
+    /// Loads information about the call given the `Message`.
+    ///
+    /// If the `Message` is not a call message, returns `None`
+    pub fn load_call_by_message(&self, call: Message) -> Option<CallInfo> {
         if call.viewtype != Viewtype::Call {
             // This can happen e.g. if a "call accepted"
             // or "call ended" message is received
@@ -581,42 +620,7 @@ pub async fn call_state(context: &Context, msg_id: MsgId) -> Result<CallState> {
         .load_call_by_id(msg_id)
         .await?
         .with_context(|| format!("{msg_id} is not a call message"))?;
-    let state = if call.is_incoming() {
-        if call.is_accepted() {
-            if call.is_ended() {
-                CallState::Completed {
-                    duration: call.duration_seconds(),
-                }
-            } else {
-                CallState::Active
-            }
-        } else if call.is_canceled() {
-            // Call was explicitly canceled
-            // by the caller before we picked it up.
-            CallState::Missed
-        } else if call.is_ended() {
-            CallState::Declined
-        } else if call.is_stale() {
-            CallState::Missed
-        } else {
-            CallState::Alerting
-        }
-    } else if call.is_accepted() {
-        if call.is_ended() {
-            CallState::Completed {
-                duration: call.duration_seconds(),
-            }
-        } else {
-            CallState::Active
-        }
-    } else if call.is_canceled() {
-        CallState::Canceled
-    } else if call.is_ended() || call.is_stale() {
-        CallState::Declined
-    } else {
-        CallState::Alerting
-    };
-    Ok(state)
+    Ok(call.call_state())
 }
 
 /// ICE server for JSON serialization.
@@ -658,12 +662,9 @@ pub(crate) async fn create_ice_servers_from_metadata(
     Ok((expiration_timestamp, ice_servers))
 }
 
-/// STUN or TURN server with unresolved DNS name.
+/// TURN server with unresolved DNS name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum UnresolvedIceServer {
-    /// STUN server.
-    Stun { hostname: String, port: u16 },
-
     /// TURN server with the username and password.
     Turn {
         hostname: String,
@@ -688,28 +689,6 @@ pub(crate) async fn resolve_ice_servers(
 
     for unresolved_ice_server in unresolved_ice_servers {
         match unresolved_ice_server {
-            UnresolvedIceServer::Stun { hostname, port } => {
-                match lookup_host_with_cache(context, &hostname, port, "", load_cache).await {
-                    Ok(addrs) => {
-                        let urls: Vec<String> = addrs
-                            .into_iter()
-                            .map(|addr| format!("stun:{addr}"))
-                            .collect();
-                        let stun_server = IceServer {
-                            urls,
-                            username: None,
-                            credential: None,
-                        };
-                        result.push(stun_server);
-                    }
-                    Err(err) => {
-                        warn!(
-                            context,
-                            "Failed to resolve STUN {hostname}:{port}: {err:#}."
-                        );
-                    }
-                }
-            }
             UnresolvedIceServer::Turn {
                 hostname,
                 port,
@@ -742,25 +721,17 @@ pub(crate) async fn resolve_ice_servers(
 
 /// Creates JSON with ICE servers when no TURN servers are known.
 pub(crate) fn create_fallback_ice_servers() -> Vec<UnresolvedIceServer> {
-    // Do not use public STUN server from https://stunprotocol.org/.
-    // It changes the hostname every year
-    // (e.g. stunserver2025.stunprotocol.org
-    // which was previously stunserver2024.stunprotocol.org)
-    // because of bandwidth costs:
-    // <https://github.com/jselbie/stunserver/issues/50>
-
-    vec![
-        UnresolvedIceServer::Stun {
-            hostname: "nine.testrun.org".to_string(),
-            port: STUN_PORT,
-        },
-        UnresolvedIceServer::Turn {
-            hostname: "turn.delta.chat".to_string(),
-            port: STUN_PORT,
-            username: "public".to_string(),
-            credential: "o4tR7yG4rG2slhXqRUf9zgmHz".to_string(),
-        },
-    ]
+    // As long as we can't rely on most chat profiles
+    // having a multi-relay setup and offering TURN servers,
+    // fall back to a service run by Delta Chat developers
+    // which ensures that no IP addresses or other metadata is
+    // persistently logged.
+    vec![UnresolvedIceServer::Turn {
+        hostname: "turn.delta.chat".to_string(),
+        port: TURN_PORT,
+        username: "public".to_string(),
+        credential: "o4tR7yG4rG2slhXqRUf9zgmHz".to_string(),
+    }]
 }
 
 /// Returns JSON with ICE servers.

@@ -1,11 +1,298 @@
 # Changelog
 
+## [2.63.0] - 2026-10-09
+
+### API-Changes
+
+- add `PinnedMessagesChanged` event.
+- [**breaking**]: remove unused `dc_chatlist_get_summary2()` ([#8812](https://github.com/chatmail/core/pull/8812))
+- new `dc_msg_get_summary_text()` ([#8813](https://github.com/chatmail/core/pull/8813)).
+
+### Features / Changes
+
+- connect to the most recently successfully used SMTP transport first.
+- re-add "second device added" message if deleted soon after transfer ([#8758](https://github.com/chatmail/core/pull/8758)).
+- do not request MDNs for unencrypted messages.
+- do not send unencrypted MDNs.
+- add context to HTTP(S) proxy connection errors.
+- deltachat-repl: remove "reset" command.
+
+### Fixes
+
+- Correctly percent-encode addresses in securejoin invite codes ([#8747](https://github.com/chatmail/core/pull/8747)).
+- regenerate deltachat.pc if env changed ([#8752](https://github.com/chatmail/core/pull/8752)).
+- delete handled securejoin messages on all relays.
+- add headers to unencrypted MDNs.
+- In SMTP loop, reset `transport_id` and `from` when disconnecting ([#8797](https://github.com/chatmail/core/pull/8797)).
+- deltachat-rpc-client: shutdown all threads after RPC server crash.
+- (linux-only) make sure large attachments return memory to kernel.
+- do not reencode animated WebPs into JPEG.
+
+### CI
+
+- update Rust to 1.99.0.
+- speedup lint job and the Rust test builds
+
+### Refactor
+
+- [**breaking**] stop saving legacy config values when configuring a transport.
+  - core does not set deprecated config values `addr`, `mail_pw` etc. Use `list_transports()` API instead.
+- get rid of dead sticker-related code in check_or_recode_to_size().
+- factor add_headers_to_part() out of mimefactory::add_headers_to_protected_part().
+- replace MimeFactory::from_mdn() with a standalone mimefactory::mdn().
+- take securejoin addresses from transport list.
+- deltachat-repl: move all commands to cmdline.rs.
+- do not guess image format from file extension on I/O error.
+- reduce macro-generated lines by >70%, and drop tracing.
+- stop excluding `COPYUID` responses from the logs.
+
+### Tests
+
+- move pinned messages tests into pinned_messages_tests module.
+- Add basic tests for rendering unencrypted messages ([#8736](https://github.com/chatmail/core/pull/8736)).
+- do not ignore errors in add_pseudo_transport().
+- test sending and receiving long filename with emojis.
+
+### Miscellaneous Tasks
+
+- update rPGP from 0.20.0 to 0.21.0.
+- reduce noise created by key-contact migration.
+- enable `clippy::unnecessary_wraps`, fix `clippy::redundant_clone` and `clippy::string_lit_as_bytes` suggestions.
+- add chatmail.au.
+- add chatmail.cc ([#8756](https://github.com/chatmail/core/pull/8756)).
+- remove some `unwrap()` calls.
+- remove unused "sdp" dependency.
+- cargo: bump smallvec from 1.15.2 to 1.16.1.
+- cargo: bump syn from 3.0.4 to 3.0.6.
+- deps: bump zizmorcore/zizmor-action from 0.6.2 to 0.6.4.
+- cargo: bump mailparse from 0.16.1 to 0.17.0.
+- cargo: bump uuid from 1.25.0 to 1.26.1.
+- deps: bump cachix/install-nix-action from 31.11.0 to 31.11.1.
+- cargo: bump hyper from 1.10.1 to 1.11.1.
+- cargo: bump tokio-rustls from 0.26.4 to 0.26.5.
+- cargo: bump thiserror from 2.0.20 to 2.0.21.
+- deps: bump taiki-e/install-action from 2.86.7 to 2.87.20.
+- cargo: bump hyper-util from 0.1.20 to 0.1.21.
+- cargo: bump dirs from 6.0.0 to 7.0.0.
+- move deltachat-time to dev dependencies.
+- update astral-tokio-tar from 0.6.4 to 0.7.0.
+- update async-imap to 0.12.0.
+- update mail-builder to 1.0.
+
+## [2.62.0] - 2026-09-22
+
+### API-Changes
+
+- Remove unused ImapMessageMoved event.
+- [**breaking**] get rid of `Qr::FprWithoutAddr` and `Qr::FprMismatch` variants.
+  - removed `DC_QR_FPR_WITHOUT_ADDR` and `DC_QR_FPR_MISMATCH` constants from CFFI
+  - removed FprWithoutAddr and FprMismatch variants from JSON-RPC QrObject returned by `check_qr`
+
+### Features / Changes
+
+- Don't show "member added" messages in channels ([#8730](https://github.com/chatmail/core/pull/8730)).
+
+### Fixes
+
+- Don't notify about a reaction sent by a blocked contact ([#8729](https://github.com/chatmail/core/pull/8729)).
+- keep a message read status if a failure arrives later.
+- prefer login errors over connection errors in the log message ([#8727](https://github.com/chatmail/core/pull/8727)).
+- blocked or email contacts contacts are never recently seen or old ([#8733](https://github.com/chatmail/core/pull/8733)).
+
+### Refactor
+
+- Remove code that moves messages between IMAP folders.
+
+## [2.61.0] - 2026-09-21
+
+### API-Changes
+
+- add `init_transports()` for multi-relay onboarding.
+- add JSON-RPC API `is_sending_finished()`.
+- [**breaking**] remove verification methods from the FFI and JSON-RPC APIs.
+  - `dc_contact_is_verified()` and `dc_contact_get_verifier_id()` are removed.
+  - the JSON-RPC Contact object loses the `isVerified` and `verifierId` fields. A bot reading `snapshot.is_verified` now gets an `AttributeError` at runtime.
+  - the Python bindings lose `Contact.is_verified()` and `Contact.get_verifier()`.
+  - `DC_STR_CONTACT_VERIFIED` (35) is removed, so UIs should stop registering a translation for it. A stock id core does not know is logged and otherwise ignored, so an un-updated client keeps working.
+- [**breaking**] remove default value for "addr" config.
+- [**breaking**] remove `addr` field from Account objects in JSON-RPC APIs.
+  - `list_transports()` should be used instead.
+- [**breaking**] remove `is_chatmail` and the XCHATMAIL capability.
+  - `is_chatmail` is no longer a known config key.
+- [**breaking**] remove `Contact.get_name_n_addr()` and related APIs.
+  - `dc_contact_get_name_n_addr()` CFFI is removed
+  - JSON-RPC contact objects don't have nameAndAddr field anymore
+- [**breaking**] replace `was_seen_recently` by `freshness` in contact object.
+  - use contact's `freshness` instead of `seen_recently`
+
+### Fixes
+
+- always emit `AccountsBackgroundFetchDone`.
+- make `background_fetch` not wait on or trigger SMTP connections.
+- do not send a sync message when changing `configured_addr`.
+- emit `SmtpMessageSent` event after deleting the message from SMTP queue.
+- don't use extra STUN nine server for fallback.
+- use `max_smtp_rcpt_to` chunking for the actual transport we are sending from.
+- use correct `From` address when sending MDNs.
+- use correct address for Bcc-self in unencrypted mails.
+- don't emit configure progress events during background relay additions.
+
+### Features / Changes
+
+- better quality of image recoding ([#8682](https://github.com/chatmail/core/pull/8682)).
+- perform background fetch from all transports.
+- queue messages for SMTP before encryption.
+- [**breaking**] stop tracking contact verification.
+  - the statistics JSON sent to the self-reporting-bot on Android changes: Contacts have `encrypted` instead of `verified` and lose `transitive_chain` properties and message stats have `encrypted` instead of `verified` and `unverified_encrypted`, and securejoin invites lose `already_verified`. The collecting bot stores incoming reports verbatim but analysis will have to make sense of older and newer reports.
+- remove last usage of XDELTAPUSH capability.
+- base server-side message deletion on `force_encryption`.
+- do not restart I/O when setting `configured_addr`.
+- do not use ConfiguredAddr when connecting to SMTP.
+- mark autorelays for relay operators ([#8701](https://github.com/chatmail/core/pull/8701)).
+- try fasted relays to attempt first configure on.
+- do not mark message as failed for which we got a read receipt before.
+- a single NDN does not mark a group message as failed.
+
+### Documentation
+
+- update `sys.msgsize_max_recommended` documentation.
+- add hint about how to reset an invitation ([#8160](https://github.com/chatmail/core/pull/8160)).
+- mention `get_app_version()` API in the changelog for 2.59.0.
+- remove `protect_autocrypt` setting.
+
+### Miscellaneous Tasks
+
+- cleanup "primary" wording in comments.
+- update rustls to 0.23.45.
+- fix nightly "cargo" warnings.
+- fix some types in `deltachat_rpc_client`.
+
+### Refactor
+
+- add `Encryption.is_encrypted()`.
+- separate QueuedEncryption.
+- sql: disable double-quoted string literals.
+- add smtp::queue module.
+- substitute configure progress macro with simple function call.
+
+### Tests
+
+- cleanup `get_smtp_rows_for_msg()`.
+- cross-core securejoin invites for every chat type.
+- explicitly empty url in appversion updates ([#8702](https://github.com/chatmail/core/pull/8702)).
+- do not talk about "inconsistent key state" in `test_securejoin_after_contact_resetup`.
+- rename `test_aeap_transition_{0,1}` to `test_aeap_transition_{single,group}`.
+- do not fetch all messages when `direct_imap` is created.
+- `direct_imap`: always pass `mark_seen=False` to fetch().
+- add pseudo transport explicitly rather than by setting ConfiguredAddr.
+
+## [2.60.0] - 2026-09-11
+
+### API-Changes
+
+- [**breaking**] remove a relay immediately instead of unpublishing it.
+  - `set_transport_unpublished()` is removed: UIs call `delete_transport()` when the user removes a relay.
+  - `list_transports_ex()` and the `TransportListEntry` type are removed: use `list_transports()`.
+  - `delete_transport()` no longer refuses to remove the primary transport: it refuses only to remove the last one and re-elects the sending transport as needed.
+  - `TransportsModified` is now also emitted on the device modifying the transports, not only on devices applying the synced change.
+- [**breaking**] do not load webxdc icon if it has too large dimensions.
+  - `get_webxdc_blob()` may fail to load `icon.png` or `icon.jpg` if image dimensions are too large.
+    Fixing the issue discovered by https://github.com/Sergei768
+- Generate JSON-RPC headers at build time ([#8350](https://github.com/chatmail/core/pull/8350)).
+- Generate Qt JSON-RPC bindings ([#8330](https://github.com/chatmail/core/pull/8330)).
+
+### Features / Changes
+
+- Introduce keyupdate messages informing contacts about relay changes.
+- Remove `Final-Recipient` from MDNs (and keyupdates).
+- Carry all published relay addresses in securejoin links ([#8591](https://github.com/chatmail/core/pull/8591)).
+- Use display name for contacts in encryption info ([#8609](https://github.com/chatmail/core/pull/8609)).
+- Do not create device messages for IMAP authentication errors.
+- Delete avatars referred to by parameters of special contacts.
+- Import `Autocrypt-Gossip` keys without checking the addresses.
+- Ignore `Chat-Disposition-Notification-To` value.
+- Increase `sys.msgsize_max_recommended` to match chatmail relay message size limit.
+
+### Fixes
+
+- Do not try to load profile image from param for self.
+- Send legacy securejoin key requests as `multipart/mixed` so they are not rejected by chatmail relays.
+- rpc: avoid hang when requests race a dying rpc-server.
+- Take `timestamp_rcvd` into account in `estimate_deletion_cnt`.
+- Reliably complete configuration with progress=1000 or progress=0.
+- Make `create_send_msg_jobs` actually return row IDs.
+- Don't notify of missed call from blocked user.
+- Trash MDNs that reference no message early.
+- Return no relay address for key-contacts without an address.
+- Do not emit events in `set_profile_image()` if contact avatar is unchanged.
+- Remove `Original-Recipient` field from MDNs.
+- ffi: support custom allocators in event string getters.
+- Start checking column documentation in CI and add comment for `transports.add_timestamp`.
+- Sanitize `version_string` we got from the wire ([#8582](https://github.com/chatmail/core/pull/8582))
+- RUSTSEC-2026-0258 ([#8603](https://github.com/chatmail/core/pull/8603)).
+
+### Build system
+
+- Use `--locked` in `scripts/clippy.sh`.
+- Produce correct wheel metadata.
+
+### Documentation
+
+- Always suggest using `--locked` with "cargo install".
+- JSON-RPC: clarify when `reactions` is `None`.
+- Fix async-imap and async-smtp URLs in README.md ([#8637](https://github.com/chatmail/core/pull/8637)).
+- Update the timeout value in `DC_EVENT_CALL_ENDED` description.
+
+### Refactor
+
+- Don't store email address in location KML. ([#8615](https://github.com/chatmail/core/pull/8615)).
+- Turn `DC_CHAT_ID_*` into `ChatId::*` associated constants.
+- Turn `DC_MSG_ID_*` into `MsgId::*` associated constants.
+- Don't include email addresses in export filenames ([#8626](https://github.com/chatmail/core/pull/8626)).
+- Make `create_send_msg_jobs()` private.
+- Rename `automatic_relay_management` to autorelay.
+- Extract shared pieces for non-chat messages.
+- Remove unused functions from the tools module.
+- Remove the code to set own avatar in `set_profile_image()`.
+- Move pgp tests to submodule.
+- Split `flake.nix` into multiple files.
+- Use `&[..]` instead of `&Vec<..>`.
+
+### Tests
+
+- [**breaking**] rename rpc fixtures to disambiguate from ffi fixtures.
+- Test `dc_send_msg_sync()`.
+- Print which error/warning was expected if it does not arrive.
+
+### CI
+
+- Update Rust to 1.98.1.
+
+### Miscellaneous Tasks
+
+- Add script to show the sizes of futures (async Rust) ([#8536](https://github.com/chatmail/core/pull/8536)).
+- deps: bump zizmorcore/zizmor-action from 0.6.1 to 0.6.2.
+- deps: bump swatinem/rust-cache from 2.9.1 to 2.9.2.
+- deps: bump pypa/gh-action-pypi-publish from 1.14.1 to 1.14.2.
+- deps: bump taiki-e/install-action from 2.85.1 to 2.86.7.
+- cargo: bump futures from 0.3.33 to 0.3.34.
+- cargo: bump thiserror from 2.0.19 to 2.0.20.
+- cargo: bump syn from 3.0.3 to 3.0.4.
+- cargo: bump log from 0.4.33 to 0.4.34.
+- cargo: bump mail-builder from 0.4.4 to 0.5.0.
+- cargo: bump blake3 from 1.8.5 to 1.8.7.
+- cargo: bump http-body-util from 0.1.3 to 0.1.5.
+- cargo: bump uuid from 1.20.0 to 1.25.0.
+- cargo: bump data-encoding from 2.11.0 to 2.11.1.
+- bump chacha20 0.10.1 to 0.10.2.
+
 ## [2.59.0] - 2026-08-14
 
 ### API-Changes
 
 - [**breaking**] Remove deprecated `dc_chat_is_protected()`.
 - Deprecate `dc_chat_get_info_json()` ([#8580](https://github.com/chatmail/core/pull/8580))
+- New `get_app_version()` JSON-RPC API to get information about available updates.
 
 ### Features / Changes
 
@@ -8692,3 +8979,7 @@ https://github.com/chatmail/core/pulls?q=is%3Apr+is%3Aclosed
 [2.57.0]: https://github.com/chatmail/core/compare/v2.56.0..v2.57.0
 [2.58.0]: https://github.com/chatmail/core/compare/v2.57.0..v2.58.0
 [2.59.0]: https://github.com/chatmail/core/compare/v2.58.0..v2.59.0
+[2.60.0]: https://github.com/chatmail/core/compare/v2.59.0..v2.60.0
+[2.61.0]: https://github.com/chatmail/core/compare/v2.60.0..v2.61.0
+[2.62.0]: https://github.com/chatmail/core/compare/v2.61.0..v2.62.0
+[2.63.0]: https://github.com/chatmail/core/compare/v2.62.0..v2.63.0

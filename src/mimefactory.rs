@@ -1,7 +1,6 @@
 //! # MIME message production.
 
 use std::collections::{BTreeSet, HashSet};
-use std::io::Cursor;
 
 use anyhow::{Context as _, Result, bail, format_err};
 use base64::Engine as _;
@@ -26,7 +25,6 @@ use crate::download::PostMsgMetadata;
 use crate::ensure_and_debug_assert;
 use crate::ephemeral::Timer as EphemeralTimer;
 use crate::headerdef::HeaderDef;
-use crate::key;
 use crate::key::{DcKey, SignedPublicKey, SignedSecretKey, load_self_public_key, self_fingerprint};
 use crate::location;
 use crate::log::warn;
@@ -36,27 +34,26 @@ use crate::param::Param;
 use crate::peer_channels::{create_iroh_header, get_iroh_topic_for_msg};
 use crate::pgp::{SeipdVersion, addresses_from_public_key, pubkey_supports_seipdv2, relay_addrs};
 use crate::simplify::escape_message_footer_marks;
+use crate::smtp::queue::{
+    Encryption as QueuedEncryption, QueuedMail, SideEffects as QueueSideEffects, ToBeQueuedMail,
+};
 use crate::stock_str;
 use crate::tools::{IsNoneOrEmpty, create_outgoing_rfc724_mid, remove_subject_prefix, time};
 use crate::webxdc::StatusUpdateSerial;
 
-// attachments of 25 mb brutto should work on the majority of providers
-// (brutto examples: web.de=50, 1&1=40, t-online.de=32, gmail=25, posteo=50, yahoo=25, all-inkl=100).
-// to get the netto sizes, we subtract 1 mb header-overhead and the base64-overhead.
-pub const RECOMMENDED_FILE_SIZE: u64 = 24 * 1024 * 1024 / 4 * 3;
-
-#[derive(Debug, Clone)]
-#[expect(clippy::large_enum_variant)]
-pub enum Loaded {
-    Message {
-        chat: Chat,
-        msg: Message,
-    },
-    Mdn {
-        rfc724_mid: String,
-        additional_msg_ids: Vec<String>,
-    },
-}
+/// Maximum attachment file size.
+///
+/// This is used to limit the size of attached webxdc updates.
+/// This constant is also available to UIs via sys.msgsize_max_recommended config
+/// and is used when encoding video files. UIs may refuse to attach files larger than this size.
+///
+/// 30 MiB is the default maximum file size for chatmail relays as of 2026-09-10.
+/// Attachments of 25 mb brutto should work on the majority of providers
+/// (brutto examples: web.de=50, 1&1=40, t-online.de=32, gmail=25, posteo=50, yahoo=25, all-inkl=100).
+///
+/// To get the netto sizes, we subtract 1 MiB overhead for headers
+/// and divide by 4/3 to account for base64 encoding.
+pub const RECOMMENDED_FILE_SIZE: u64 = (30 - 1) * 1024 * 1024 / 4 * 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PreMessageMode {
@@ -85,6 +82,32 @@ enum Encryption {
 
     /// Symmetrically encrypted message with a shared secret.
     Symmetric { shared_secret: String },
+}
+
+impl Encryption {
+    pub fn is_encrypted(&self) -> bool {
+        match self {
+            Self::No => false,
+            Self::Asymmetric { .. } => true,
+            Self::Symmetric { .. } => true,
+        }
+    }
+
+    /// Converts into [`QueuedEncryption`] by dropping email addresses corresponding to the keys.
+    fn into_queued_encryption(self) -> QueuedEncryption {
+        match self {
+            Encryption::No => QueuedEncryption::No,
+            Encryption::Asymmetric { encryption_pubkeys } => QueuedEncryption::Asymmetric {
+                encryption_pubkeys: encryption_pubkeys
+                    .into_iter()
+                    .map(|(_addr, key)| key)
+                    .collect(),
+            },
+            Encryption::Symmetric { shared_secret } => {
+                QueuedEncryption::Symmetric { shared_secret }
+            }
+        }
+    }
 }
 
 /// Helper to construct mime messages.
@@ -147,7 +170,10 @@ pub struct MimeFactory {
     member_timestamps: Vec<i64>,
 
     timestamp: i64,
-    loaded: Loaded,
+
+    chat: Chat,
+    msg: Message,
+
     in_reply_to: String,
 
     /// List of Message-IDs for `References` header.
@@ -186,64 +212,6 @@ pub struct RenderedMessage {
     sync_ids_to_delete: Option<String>,
 }
 
-/// Email message queued, but not sent yet.
-///
-/// It is stored unencrypted to
-/// make it possible to change protected headers
-/// like the From address and Autocrypt header later.
-#[derive(Debug, Clone)]
-pub(crate) struct QueuedMail {
-    /// Unencrypted queued message.
-    ///
-    /// This message has both the headers and the body,
-    /// but without the From, Autocrypt and Message-ID headers.
-    ///
-    /// For encrypted messages this is the OpenPGP payload.
-    raw_message: Vec<u8>,
-
-    /// Display name to put in the `From:` field.
-    ///
-    /// Email address is not determined yet here.
-    display_name: String,
-
-    /// Message-ID.
-    rfc724_mid: String,
-
-    /// Whether the message is encrypted and encryption keys.
-    encryption: Encryption,
-
-    /// If true, Autocrypt header should be added before sending.
-    should_attach_pubkey: bool,
-
-    /// If true, OpenPGP compression may be used.
-    should_compress: bool,
-
-    /// If true, encrypted message should be signed as well.
-    should_sign: bool,
-}
-
-/// Side effects that should be applied at the same time
-/// as the message is persisted in the queue.
-#[derive(Debug, Clone, Default)]
-pub struct RenderSideEffects {
-    /// Largest timestamp of the location sent in `location.kml` in this message.
-    pub last_added_location_timestamp: Option<i64>,
-
-    /// True if the message has the avatar attached.
-    ///
-    /// Timestamp of the last time avatar was gossiped should be updated.
-    pub avatar_is_attached: bool,
-
-    /// A comma-separated string of sync-IDs that are used by the rendered email and must be deleted
-    /// from `multi_device_sync` once the message is actually queued for sending.
-    pub sync_ids_to_delete: Option<String>,
-
-    /// Subject that was rendered into the message.
-    ///
-    /// Used to update the subject on the sent message object.
-    pub subject: String,
-}
-
 /// Renders [`QueuedMail`].
 ///
 /// Adds headers:
@@ -257,7 +225,6 @@ pub(crate) fn render_queued_mail(
     public_key: &SignedPublicKey,
     secret_key: &SignedSecretKey,
     from_addr: String,
-    side_effects: RenderSideEffects,
 ) -> Result<RenderedEmail> {
     let QueuedMail {
         rfc724_mid,
@@ -267,32 +234,30 @@ pub(crate) fn render_queued_mail(
         should_attach_pubkey,
         should_compress,
         should_sign,
+        recipients: _,
+        sent_to: _,
+        bcc_self: _,
     } = queued_mail;
 
     let mut inner_headers: Vec<u8> = Vec::new();
     let mut outer_headers: Vec<u8> = Vec::new();
 
-    let is_encrypted = !matches!(encryption, Encryption::No);
+    let is_encrypted = encryption.is_encrypted();
 
-    fn add_header(
-        name: &[u8],
-        value: &impl mail_builder::headers::Header,
-        headers: &mut Vec<u8>,
-    ) -> Result<()> {
+    fn add_header(name: &[u8], value: &impl mail_builder::headers::Header, headers: &mut Vec<u8>) {
         headers.extend(name);
-        value.write_header(headers, name.len())?;
-        Ok(())
+        value.write_header(headers, name.len());
     }
 
     let from_header = new_address_with_name(&display_name, from_addr.clone());
-    add_header(b"From: ", &from_header, &mut inner_headers)?;
+    add_header(b"From: ", &from_header, &mut inner_headers);
 
     if is_encrypted {
         let unencrypted_from = Address::new_address(None::<&'static str>, from_addr.clone());
-        add_header(b"From: ", &unencrypted_from, &mut outer_headers)?;
-        add_header(b"HP-Outer: From: ", &unencrypted_from, &mut inner_headers)?;
+        add_header(b"From: ", &unencrypted_from, &mut outer_headers);
+        add_header(b"HP-Outer: From: ", &unencrypted_from, &mut inner_headers);
     } else {
-        add_header(b"From: ", &from_header, &mut outer_headers)?;
+        add_header(b"From: ", &from_header, &mut outer_headers);
     }
 
     if is_encrypted {
@@ -353,7 +318,6 @@ pub(crate) fn render_queued_mail(
             addr: from_addr,
             public_key: public_key.clone(),
             prefer_encrypt: EncryptPreference::Mutual,
-            verified: false,
         };
         let autocrypt_header = mail_builder::headers::raw::Raw::new(aheader.to_string());
         add_header(
@@ -364,7 +328,7 @@ pub(crate) fn render_queued_mail(
             } else {
                 &mut outer_headers
             },
-        )?;
+        );
     }
 
     if is_encrypted {
@@ -410,18 +374,15 @@ pub(crate) fn render_queued_mail(
     let sign_key = if should_sign { Some(secret_key) } else { None };
 
     let message = match encryption {
-        Encryption::No => raw_message,
-        Encryption::Asymmetric { encryption_pubkeys } => {
+        QueuedEncryption::No => raw_message,
+        QueuedEncryption::Asymmetric { encryption_pubkeys } => {
             let mut full_raw_message = inner_headers.clone();
             full_raw_message.extend(raw_message);
 
             // Asymmetric encryption
 
             // Use SEIPDv2 if all recipients support it.
-            let seipd_version = if encryption_pubkeys
-                .iter()
-                .all(|(_addr, pubkey)| pubkey_supports_seipdv2(pubkey))
-            {
+            let seipd_version = if encryption_pubkeys.iter().all(pubkey_supports_seipdv2) {
                 SeipdVersion::V2
             } else {
                 SeipdVersion::V1
@@ -431,7 +392,7 @@ pub(crate) fn render_queued_mail(
             // even for a single-device setup,
             // to not reveal if we have a multi-device setup to contacts.
             let mut encryption_keyring = vec![public_key.clone()];
-            encryption_keyring.extend(encryption_pubkeys.iter().map(|(_addr, key)| (*key).clone()));
+            encryption_keyring.extend(encryption_pubkeys);
 
             let encrypted = crate::pgp::pk_encrypt(
                 full_raw_message,
@@ -444,7 +405,7 @@ pub(crate) fn render_queued_mail(
             let message = wrap_encrypted_part(encrypted);
             part_to_bytes(message)
         }
-        Encryption::Symmetric { shared_secret } => {
+        QueuedEncryption::Symmetric { shared_secret } => {
             let mut full_raw_message = inner_headers.clone();
             full_raw_message.extend(raw_message);
 
@@ -464,10 +425,22 @@ pub(crate) fn render_queued_mail(
     full_message.extend(message);
     Ok(RenderedEmail {
         message: String::from_utf8_lossy(&full_message).to_string(),
-        is_encrypted,
         rfc724_mid,
-        side_effects,
     })
+}
+
+/// Renders queued mail with the current sending address.
+#[cfg(test)]
+pub(crate) async fn render_queued_mail_with_context(
+    queued_mail: QueuedMail,
+    context: &Context,
+) -> Result<RenderedEmail> {
+    let from_addr = context.get_primary_self_addr().await?;
+    let public_key = crate::key::load_self_public_key(context).await?;
+    let secret_key = crate::key::load_self_secret_key(context).await?;
+
+    let rendered_mail = render_queued_mail(queued_mail, &public_key, &secret_key, from_addr)?;
+    Ok(rendered_mail)
 }
 
 /// Result of rendering a message, ready to be submitted to a send job.
@@ -475,12 +448,8 @@ pub(crate) fn render_queued_mail(
 pub struct RenderedEmail {
     pub message: String,
 
-    pub is_encrypted: bool,
-
     /// Message ID (Message in the sense of Email)
     pub rfc724_mid: String,
-
-    pub side_effects: RenderSideEffects,
 }
 
 fn new_address_with_name(name: &str, address: String) -> Address<'static> {
@@ -525,11 +494,6 @@ impl MimeFactory {
         let mut member_fingerprints = Vec::new();
         let mut member_timestamps = Vec::new();
         let mut recipient_ids = HashSet::new();
-        let req_mdn = !chat.is_self_talk()
-            && !msg.is_system_message()
-            && msg.param.get_int(Param::Reaction).unwrap_or_default() == 0
-            && context.should_request_mdns().await?;
-
         let self_fingerprint = self_fingerprint(context).await?;
 
         let encryption = if chat.is_self_talk() {
@@ -810,6 +774,12 @@ impl MimeFactory {
             }
         };
 
+        let req_mdn = encryption.is_encrypted()
+            && !chat.is_self_talk()
+            && !msg.is_system_message()
+            && msg.param.get_int(Param::Reaction).unwrap_or_default() == 0
+            && context.should_request_mdns().await?;
+
         let (in_reply_to, references) = context
             .sql
             .query_row(
@@ -839,8 +809,8 @@ impl MimeFactory {
         // We don't display avatars for address-contacts, so sending avatars w/o encryption is not
         // useful and causes e.g. Outlook to reject a message with a big header, see
         // https://support.delta.chat/t/invalid-mime-content-single-text-value-size-32822-exceeded-allowed-maximum-32768-for-the-chat-user-avatar-header/4067.
-        let attach_selfavatar = Self::should_attach_selfavatar(context, &msg).await
-            && !matches!(encryption, Encryption::No);
+        let attach_selfavatar =
+            Self::should_attach_selfavatar(context, &msg).await && encryption.is_encrypted();
 
         ensure_and_debug_assert!(
             member_timestamps.is_empty()
@@ -863,7 +833,8 @@ impl MimeFactory {
             member_fingerprints,
             member_timestamps,
             timestamp: msg.timestamp_sort,
-            loaded: Loaded::Message { msg, chat },
+            chat,
+            msg,
             in_reply_to,
             references,
             req_mdn,
@@ -872,62 +843,6 @@ impl MimeFactory {
             pre_message_mode: PreMessageMode::None,
         };
         Ok(factory)
-    }
-
-    pub async fn from_mdn(
-        context: &Context,
-        from_id: ContactId,
-        rfc724_mid: String,
-        additional_msg_ids: Vec<String>,
-    ) -> Result<MimeFactory> {
-        let contact = Contact::get_by_id(context, from_id).await?;
-        let from_addr = context.get_primary_self_addr().await?;
-        let timestamp = time();
-
-        let addr = contact.get_addr().to_string();
-        let mut recipients = vec![addr.clone()];
-
-        let encryption = if from_id == ContactId::SELF {
-            Encryption::Asymmetric {
-                encryption_pubkeys: Vec::new(),
-            }
-        } else if contact.is_key_contact() {
-            let encryption_pubkeys = if let Some(key) = contact.public_key(context).await? {
-                recipients = relay_addrs(&key, &addr);
-                vec![(addr.clone(), key)]
-            } else {
-                Vec::new()
-            };
-            Encryption::Asymmetric { encryption_pubkeys }
-        } else {
-            Encryption::No
-        };
-
-        let res = MimeFactory {
-            from_addr,
-            from_displayname: "".to_string(),
-            sender_displayname: None,
-            selfstatus: "".to_string(),
-            recipients,
-            encryption,
-            to: vec![("".to_string(), contact.get_addr().to_string())],
-            past_members: vec![],
-            member_fingerprints: vec![],
-            member_timestamps: vec![],
-            timestamp,
-            loaded: Loaded::Mdn {
-                rfc724_mid,
-                additional_msg_ids,
-            },
-            in_reply_to: String::default(),
-            references: Vec::new(),
-            req_mdn: false,
-            attach_selfavatar: false,
-            webxdc_topic: None,
-            pre_message_mode: PreMessageMode::None,
-        };
-
-        Ok(res)
     }
 
     /// Returns whether own Autocrypt key should be attached to this MDN
@@ -939,15 +854,15 @@ impl MimeFactory {
     /// so that contacts we only read messages from
     /// still learn our current key and relay list
     /// and will likely re-gossip it to group chats.
-    async fn update_mdn_pubkey_attachment(&self, context: &Context) -> Result<bool> {
-        let Encryption::Asymmetric { encryption_pubkeys } = &self.encryption else {
-            return Ok(false);
-        };
+    async fn update_mdn_pubkey_attachment(
+        context: &Context,
+        encryption_pubkeys: &[SignedPublicKey],
+    ) -> Result<bool> {
         debug_assert!(
             encryption_pubkeys.len() <= 1,
             "MDNs have at most one recipient key; own key is only added at encryption time"
         );
-        let [(_, ref key)] = encryption_pubkeys[..] else {
+        let [ref key] = encryption_pubkeys[..] else {
             return Ok(false);
         };
         let fingerprint = key.dc_fingerprint().hex();
@@ -1029,77 +944,69 @@ impl MimeFactory {
     }
 
     fn grpimage(&self) -> Option<String> {
-        match &self.loaded {
-            Loaded::Message { chat, msg } => {
-                let cmd = msg.param.get_cmd();
+        let cmd = self.msg.param.get_cmd();
 
-                match cmd {
-                    SystemMessage::MemberAddedToGroup => {
-                        return chat.param.get(Param::ProfileImage).map(Into::into);
-                    }
-                    SystemMessage::GroupImageChanged => {
-                        return msg.param.get(Param::Arg).map(Into::into);
-                    }
-                    _ => {}
-                }
-
-                if msg
-                    .param
-                    .get_bool(Param::AttachChatAvatarAndDescription)
-                    .unwrap_or_default()
-                {
-                    return chat.param.get(Param::ProfileImage).map(Into::into);
-                }
-
-                None
+        match cmd {
+            SystemMessage::MemberAddedToGroup => {
+                return self.chat.param.get(Param::ProfileImage).map(Into::into);
             }
-            Loaded::Mdn { .. } => None,
+            SystemMessage::GroupImageChanged => {
+                return self.msg.param.get(Param::Arg).map(Into::into);
+            }
+            _ => {}
         }
+
+        if self
+            .msg
+            .param
+            .get_bool(Param::AttachChatAvatarAndDescription)
+            .unwrap_or_default()
+        {
+            return self.chat.param.get(Param::ProfileImage).map(Into::into);
+        }
+
+        None
     }
 
     async fn subject_str(&self, context: &Context) -> Result<String> {
-        let subject = match &self.loaded {
-            Loaded::Message { chat, msg } => {
-                let quoted_msg_subject = msg.quoted_message(context).await?.map(|m| m.subject);
+        let quoted_msg_subject = self.msg.quoted_message(context).await?.map(|m| m.subject);
 
-                if !msg.subject.is_empty() {
-                    return Ok(msg.subject.clone());
-                }
+        if !self.msg.subject.is_empty() {
+            return Ok(self.msg.subject.clone());
+        }
 
-                if (chat.typ == Chattype::Group || chat.typ == Chattype::OutBroadcast)
-                    && quoted_msg_subject.is_none_or_empty()
-                {
-                    let re = if self.in_reply_to.is_empty() {
-                        ""
-                    } else {
-                        "Re: "
-                    };
-                    return Ok(format!("{}{}", re, chat.name));
-                }
+        if (self.chat.typ == Chattype::Group || self.chat.typ == Chattype::OutBroadcast)
+            && quoted_msg_subject.is_none_or_empty()
+        {
+            let re = if self.in_reply_to.is_empty() {
+                ""
+            } else {
+                "Re: "
+            };
+            return Ok(format!("{}{}", re, self.chat.name));
+        }
 
-                let parent_subject = if quoted_msg_subject.is_none_or_empty() {
-                    chat.param.get(Param::LastSubject)
-                } else {
-                    quoted_msg_subject.as_deref()
-                };
-                if let Some(last_subject) = parent_subject {
-                    return Ok(format!("Re: {}", remove_subject_prefix(last_subject)));
-                }
-
-                let self_name = match Self::should_attach_profile_data(msg) {
-                    true => context.get_config(Config::Displayname).await?,
-                    false => None,
-                };
-                let self_name = &match self_name {
-                    Some(name) => name,
-                    None => context.get_config(Config::Addr).await?.unwrap_or_default(),
-                };
-                stock_str::subject_for_new_contact(context, self_name)
-            }
-            Loaded::Mdn { .. } => "Receipt Notification".to_string(), // untranslated to no reveal sender's language
+        let parent_subject = if quoted_msg_subject.is_none_or_empty() {
+            self.chat.param.get(Param::LastSubject)
+        } else {
+            quoted_msg_subject.as_deref()
         };
+        if let Some(last_subject) = parent_subject {
+            return Ok(format!("Re: {}", remove_subject_prefix(last_subject)));
+        }
 
-        Ok(subject)
+        let self_name = match Self::should_attach_profile_data(&self.msg) {
+            true => context.get_config(Config::Displayname).await?,
+            false => None,
+        };
+        let self_name = &match self_name {
+            Some(name) => name,
+            None => context
+                .get_config(Config::ConfiguredAddr)
+                .await?
+                .unwrap_or_default(),
+        };
+        Ok(stock_str::subject_for_new_contact(context, self_name))
     }
 
     pub fn recipients(&self) -> Vec<String> {
@@ -1176,10 +1083,10 @@ impl MimeFactory {
             ));
         }
 
-        if let Loaded::Message { chat, .. } = &self.loaded
-            && chat.typ == Chattype::Group
-        {
-            if !self.member_timestamps.is_empty() && !chat.member_list_is_stale(context).await? {
+        if self.chat.typ == Chattype::Group {
+            if !self.member_timestamps.is_empty()
+                && !self.chat.member_list_is_stale(context).await?
+            {
                 headers.push((
                     "Chat-Group-Member-Timestamps",
                     mail_builder::headers::raw::Raw::new(
@@ -1231,29 +1138,25 @@ impl MimeFactory {
         }
 
         // Automatic Response headers <https://www.rfc-editor.org/rfc/rfc3834>
-        if let Loaded::Mdn { .. } = self.loaded {
-            headers.push((
-                "Auto-Submitted",
-                mail_builder::headers::raw::Raw::new("auto-replied".to_string()).into(),
-            ));
-        } else if context.get_config_bool(Config::Bot).await? {
+        if context.get_config_bool(Config::Bot).await? {
             headers.push((
                 "Auto-Submitted",
                 mail_builder::headers::raw::Raw::new("auto-generated".to_string()).into(),
             ));
         }
 
-        if let Loaded::Message { msg, chat } = &self.loaded
-            && (chat.typ == Chattype::OutBroadcast || chat.typ == Chattype::InBroadcast)
-        {
+        if self.chat.typ == Chattype::OutBroadcast || self.chat.typ == Chattype::InBroadcast {
             headers.push((
                 "Chat-List-ID",
-                mail_builder::headers::text::Text::new(format!("{} <{}>", chat.name, chat.grpid))
-                    .into(),
+                mail_builder::headers::text::Text::new(format!(
+                    "{} <{}>",
+                    self.chat.name, self.chat.grpid
+                ))
+                .into(),
             ));
 
-            if msg.param.get_cmd() == SystemMessage::MemberAddedToGroup
-                && let Some(secret) = msg.param.get(PARAM_BROADCAST_SECRET)
+            if self.msg.param.get_cmd() == SystemMessage::MemberAddedToGroup
+                && let Some(secret) = self.msg.param.get(PARAM_BROADCAST_SECRET)
             {
                 headers.push((
                     "Chat-Broadcast-Secret",
@@ -1262,22 +1165,18 @@ impl MimeFactory {
             }
         }
 
-        if let Loaded::Message { msg, .. } = &self.loaded {
-            if let Some(original_rfc724_mid) = msg.param.get(Param::TextEditFor) {
-                headers.push((
-                    "Chat-Edit",
-                    mail_builder::headers::message_id::MessageId::new(
-                        original_rfc724_mid.to_string(),
-                    )
+        if let Some(original_rfc724_mid) = self.msg.param.get(Param::TextEditFor) {
+            headers.push((
+                "Chat-Edit",
+                mail_builder::headers::message_id::MessageId::new(original_rfc724_mid.to_string())
                     .into(),
-                ));
-            } else if let Some(rfc724_mid_list) = msg.param.get(Param::DeleteRequestFor) {
-                headers.push((
-                    "Chat-Delete",
-                    mail_builder::headers::message_id::MessageId::new(rfc724_mid_list.to_string())
-                        .into(),
-                ));
-            }
+            ));
+        } else if let Some(rfc724_mid_list) = self.msg.param.get(Param::DeleteRequestFor) {
+            headers.push((
+                "Chat-Delete",
+                mail_builder::headers::message_id::MessageId::new(rfc724_mid_list.to_string())
+                    .into(),
+            ));
         }
 
         headers.push((
@@ -1314,14 +1213,12 @@ impl MimeFactory {
         // Add ephemeral timer for non-MDN messages.
         // For MDNs it does not matter because they are not visible
         // and ignored by the receiver.
-        if let Loaded::Message { msg, .. } = &self.loaded {
-            let ephemeral_timer = msg.chat_id.get_ephemeral_timer(context).await?;
-            if let EphemeralTimer::Enabled { duration } = ephemeral_timer {
-                headers.push((
-                    "Ephemeral-Timer",
-                    mail_builder::headers::raw::Raw::new(duration.to_string()).into(),
-                ));
-            }
+        let ephemeral_timer = self.msg.chat_id.get_ephemeral_timer(context).await?;
+        if let EphemeralTimer::Enabled { duration } = ephemeral_timer {
+            headers.push((
+                "Ephemeral-Timer",
+                mail_builder::headers::raw::Raw::new(duration.to_string()).into(),
+            ));
         }
 
         Ok(headers)
@@ -1329,21 +1226,14 @@ impl MimeFactory {
 
     /// Helper function render the messages that are not queued.
     ///
-    /// Used for MDNs because they are fully rendered and sent in one go,
-    /// rather than first creating a [`QueuedMail`] and sending it later.
+    /// Used only for tests.
+    #[cfg(test)]
     pub async fn render(self, context: &Context) -> Result<RenderedEmail> {
-        let from_addr = context.get_primary_self_addr().await?;
-        let public_key = key::load_self_public_key(context).await?;
-        let secret_key = key::load_self_secret_key(context).await?;
-        let (queued_mail, side_effects) = Box::pin(self.into_queued_mail(context)).await?;
-        let rendered_mail = render_queued_mail(
-            queued_mail,
-            &public_key,
-            &secret_key,
-            from_addr,
-            side_effects,
-        )?;
-        Ok(rendered_mail)
+        // Does not matter, we are not going to return the QueuedMail.
+        let bcc_self = false;
+        let (queued_mail, _side_effects) =
+            Box::pin(self.into_queued_mail(context, bcc_self)).await?;
+        render_queued_mail_with_context(queued_mail, context).await
     }
 
     /// Consumes a `MimeFactory` and renders it into a message which is then stored in
@@ -1352,19 +1242,17 @@ impl MimeFactory {
     pub(crate) async fn into_queued_mail(
         mut self,
         context: &Context,
-    ) -> Result<(QueuedMail, RenderSideEffects)> {
-        let rfc724_mid = match &self.loaded {
-            Loaded::Message { msg, .. } => match &self.pre_message_mode {
-                PreMessageMode::Pre { .. } => {
-                    if msg.pre_rfc724_mid.is_empty() {
-                        create_outgoing_rfc724_mid()
-                    } else {
-                        msg.pre_rfc724_mid.clone()
-                    }
+        bcc_self: bool,
+    ) -> Result<ToBeQueuedMail> {
+        let rfc724_mid = match &self.pre_message_mode {
+            PreMessageMode::Pre { .. } => {
+                if self.msg.pre_rfc724_mid.is_empty() {
+                    create_outgoing_rfc724_mid()
+                } else {
+                    self.msg.pre_rfc724_mid.clone()
                 }
-                _ => msg.rfc724_mid.clone(),
-            },
-            Loaded::Mdn { .. } => create_outgoing_rfc724_mid(),
+            }
+            _ => self.msg.rfc724_mid.clone(),
         };
 
         let subject_str = self.subject_str(context).await?;
@@ -1374,65 +1262,44 @@ impl MimeFactory {
 
         let is_encrypted = self.will_be_encrypted();
 
-        let last_added_location_timestamp;
-        let avatar_is_attached;
-        let sync_ids_to_delete;
+        let RenderedMessage {
+            main_part,
+            mut parts,
+            last_added_location_timestamp,
+            avatar_is_attached,
+            sync_ids_to_delete,
+        } = self
+            .render_message(context, &mut headers, &grpimage, is_encrypted)
+            .await?;
 
-        let message: MimePart<'static> = match &self.loaded {
-            Loaded::Message { msg, .. } => {
-                let msg = msg.clone();
-                let RenderedMessage {
-                    main_part,
-                    mut parts,
-                    last_added_location_timestamp: tmp_last_added_location_timestamp,
-                    avatar_is_attached: tmp_avatar_is_attached,
-                    sync_ids_to_delete: tmp_sync_ids_to_delete,
-                } = self
-                    .render_message(context, &mut headers, &grpimage, is_encrypted)
-                    .await?;
-                last_added_location_timestamp = tmp_last_added_location_timestamp;
-                avatar_is_attached = tmp_avatar_is_attached;
-                sync_ids_to_delete = tmp_sync_ids_to_delete;
-                if parts.is_empty() {
-                    // Single part, render as regular message.
-                    main_part
-                } else {
-                    parts.insert(0, main_part);
-
-                    // Multiple parts, render as multipart.
-                    if msg.param.get_cmd() == SystemMessage::MultiDeviceSync {
-                        MimePart::new("multipart/report; report-type=multi-device-sync", parts)
-                    } else if msg.param.get_cmd() == SystemMessage::WebxdcStatusUpdate {
-                        MimePart::new("multipart/report; report-type=status-update", parts)
-                    } else {
-                        MimePart::new("multipart/mixed", parts)
-                    }
-                }
-            }
-            Loaded::Mdn { .. } => {
-                last_added_location_timestamp = None;
-                avatar_is_attached = false;
-                sync_ids_to_delete = None;
-                self.render_mdn()?
-            }
-        };
-
-        let should_attach_pubkey = match &self.loaded {
-            Loaded::Message { .. } => true,
-            Loaded::Mdn { .. } => self.update_mdn_pubkey_attachment(context).await?,
-        };
-        let is_post_message = self.pre_message_mode == PreMessageMode::Post;
-        let side_effects = RenderSideEffects {
+        let side_effects = QueueSideEffects {
+            chat_id: self.msg.chat_id,
             avatar_is_attached,
             sync_ids_to_delete,
             last_added_location_timestamp,
             subject: subject_str,
         };
 
-        let is_securejoin_message = match &self.loaded {
-            Loaded::Message { msg, .. } => msg.param.get_cmd() == SystemMessage::SecurejoinMessage,
-            Loaded::Mdn { .. } => false,
+        let message: MimePart<'static> = if parts.is_empty() {
+            // Single part, render as regular message.
+            main_part
+        } else {
+            parts.insert(0, main_part);
+
+            // Multiple parts, render as multipart.
+            if self.msg.param.get_cmd() == SystemMessage::MultiDeviceSync {
+                MimePart::new("multipart/report; report-type=multi-device-sync", parts)
+            } else if self.msg.param.get_cmd() == SystemMessage::WebxdcStatusUpdate {
+                MimePart::new("multipart/report; report-type=status-update", parts)
+            } else {
+                MimePart::new("multipart/mixed", parts)
+            }
         };
+
+        let should_attach_pubkey = true;
+        let is_post_message = self.pre_message_mode == PreMessageMode::Post;
+
+        let is_securejoin_message = self.msg.param.get_cmd() == SystemMessage::SecurejoinMessage;
 
         // Disable compression for SecureJoin to ensure
         // there are no compression side channels
@@ -1450,90 +1317,69 @@ impl MimeFactory {
             let gossip_period = context.get_config_i64(Config::GossipPeriod).await?;
             let now = time();
 
-            match &self.loaded {
-                Loaded::Message { chat, msg } => {
-                    if !should_hide_recipients(msg, chat) {
-                        for (addr, key) in encryption_pubkeys {
-                            let fingerprint = key.dc_fingerprint().hex();
-                            let cmd = msg.param.get_cmd();
-                            if is_post_message {
-                                continue;
-                            }
+            if !should_hide_recipients(&self.msg, &self.chat) {
+                for (addr, key) in encryption_pubkeys {
+                    let fingerprint = key.dc_fingerprint().hex();
+                    let cmd = self.msg.param.get_cmd();
+                    if is_post_message {
+                        continue;
+                    }
 
-                            let should_do_gossip = cmd == SystemMessage::MemberAddedToGroup
-                                || cmd == SystemMessage::SecurejoinMessage
-                                || multiple_recipients && {
-                                    let gossiped_timestamp: Option<i64> = context
-                                        .sql
-                                        .query_get_value(
-                                            "SELECT timestamp
-                                         FROM gossip_timestamp
-                                         WHERE chat_id=? AND fingerprint=?",
-                                            (chat.id, &fingerprint),
-                                        )
-                                        .await?;
-
-                                    // `gossip_period == 0` is a special case for testing,
-                                    // enabling gossip in every message.
-                                    //
-                                    // If current time is in the past compared to
-                                    // `gossiped_timestamp`, we also gossip because
-                                    // either the `gossiped_timestamp` or clock is wrong.
-                                    gossip_period == 0
-                                        || gossiped_timestamp
-                                            .is_none_or(|ts| now >= ts + gossip_period || now < ts)
-                                };
-
-                            let verifier_id: Option<u32> = context
+                    let should_do_gossip = cmd == SystemMessage::MemberAddedToGroup
+                        || cmd == SystemMessage::SecurejoinMessage
+                        || multiple_recipients && {
+                            let gossiped_timestamp: Option<i64> = context
                                 .sql
                                 .query_get_value(
-                                    "SELECT verifier FROM contacts WHERE fingerprint=?",
-                                    (&fingerprint,),
+                                    "SELECT timestamp
+                                         FROM gossip_timestamp
+                                         WHERE chat_id=? AND fingerprint=?",
+                                    (self.chat.id, &fingerprint),
                                 )
                                 .await?;
 
-                            let is_verified =
-                                verifier_id.is_some_and(|verifier_id| verifier_id != 0);
+                            // `gossip_period == 0` is a special case for testing,
+                            // enabling gossip in every message.
+                            //
+                            // If current time is in the past compared to
+                            // `gossiped_timestamp`, we also gossip because
+                            // either the `gossiped_timestamp` or clock is wrong.
+                            gossip_period == 0
+                                || gossiped_timestamp
+                                    .is_none_or(|ts| now >= ts + gossip_period || now < ts)
+                        };
 
-                            if !should_do_gossip {
-                                continue;
-                            }
+                    if !should_do_gossip {
+                        continue;
+                    }
 
-                            let header = Aheader {
-                                addr: addr.clone(),
-                                public_key: key.clone(),
-                                // Autocrypt 1.1.0 specification says that
-                                // `prefer-encrypt` attribute SHOULD NOT be included.
-                                prefer_encrypt: EncryptPreference::NoPreference,
-                                verified: is_verified,
-                            }
-                            .to_string();
+                    let header = Aheader {
+                        addr: addr.clone(),
+                        public_key: key.clone(),
+                        // Autocrypt 1.1.0 specification says that
+                        // `prefer-encrypt` attribute SHOULD NOT be included.
+                        prefer_encrypt: EncryptPreference::NoPreference,
+                    }
+                    .to_string();
 
-                            headers.push((
-                                "Autocrypt-Gossip",
-                                mail_builder::headers::raw::Raw::new(header).into(),
-                            ));
+                    headers.push((
+                        "Autocrypt-Gossip",
+                        mail_builder::headers::raw::Raw::new(header).into(),
+                    ));
 
-                            context
-                                .sql
-                                .execute(
-                                    "INSERT INTO gossip_timestamp (chat_id, fingerprint, timestamp)
+                    context
+                        .sql
+                        .execute(
+                            "INSERT INTO gossip_timestamp (chat_id, fingerprint, timestamp)
                                      VALUES                       (?, ?, ?)
                                      ON CONFLICT                  (chat_id, fingerprint)
                                      DO UPDATE SET timestamp=excluded.timestamp",
-                                    (chat.id, &fingerprint, now),
-                                )
-                                .await?;
-                        }
-                    }
-                }
-                Loaded::Mdn { .. } => {
-                    // Never gossip in MDNs.
+                            (self.chat.id, &fingerprint, now),
+                        )
+                        .await?;
                 }
             }
         }
-
-        let is_encrypted = self.will_be_encrypted();
 
         let display_name = if is_securejoin_message && !is_encrypted {
             // Unencrypted securejoin messages should _not_ include the display name.
@@ -1542,25 +1388,13 @@ impl MimeFactory {
             self.from_displayname.clone()
         };
 
-        let is_mdn = matches!(self.loaded, Loaded::Mdn { .. });
-        let should_sign = true;
-
-        let message = if self.will_be_encrypted() {
+        let message = if is_encrypted {
             add_headers_to_encrypted_part(message, headers)
-        } else if is_mdn {
-            // Never add outer multipart/mixed wrapper to MDN
-            // as multipart/report Content-Type is used to recognize MDNs
-            // by Delta Chat receiver and Chatmail servers
-            // allowing them to be unencrypted and not contain Autocrypt header
-            // without resetting Autocrypt encryption or triggering Chatmail filter
-            // that normally only allows encrypted mails.
-            message
         } else {
             // Unencrypted message.
-            let message = if let Loaded::Message { msg, .. } = &self.loaded
-                && msg.param.get_cmd() == SystemMessage::SecurejoinMessage
+            let message = if self.msg.param.get_cmd() == SystemMessage::SecurejoinMessage
                 && matches!(
-                    msg.param.get(Param::Arg),
+                    self.msg.param.get(Param::Arg),
                     Some("vc-request") | Some("vg-request")
                 ) {
                 // Workaround for legacy SecureJoin {vc,vg}-request messages.
@@ -1573,37 +1407,32 @@ impl MimeFactory {
                 message
             };
 
-            headers.iter().fold(message, |message, (header, value)| {
-                debug_assert_ne!(*header, "from");
-                debug_assert_ne!(*header, "message-id");
-                debug_assert_ne!(*header, "autocrypt");
-                message.header(*header, value.clone())
-            })
+            add_headers_to_part(message, headers)
         };
         let raw_message = part_to_bytes(message);
+        let recipients = self.recipients();
 
         let queued_email = QueuedMail {
             raw_message,
             rfc724_mid,
             display_name,
-            encryption: self.encryption,
+            encryption: self.encryption.into_queued_encryption(),
             should_attach_pubkey,
-            should_sign,
+            should_sign: true,
             should_compress,
+            recipients,
+            sent_to: Vec::new(),
+            bcc_self,
         };
         Ok((queued_email, side_effects))
     }
 
     /// Returns MIME part with a `message.kml` attachment.
     fn get_message_kml_part(&self) -> Option<MimePart<'static>> {
-        let Loaded::Message { msg, .. } = &self.loaded else {
-            return None;
-        };
+        let latitude = self.msg.param.get_float(Param::SetLatitude)?;
+        let longitude = self.msg.param.get_float(Param::SetLongitude)?;
 
-        let latitude = msg.param.get_float(Param::SetLatitude)?;
-        let longitude = msg.param.get_float(Param::SetLongitude)?;
-
-        let kml_file = location::get_message_kml(msg.timestamp_sort, latitude, longitude);
+        let kml_file = location::get_message_kml(self.msg.timestamp_sort, latitude, longitude);
         let part = MimePart::new("application/vnd.google-earth.kml+xml", kml_file)
             .attachment("message.kml");
         Some(part)
@@ -1615,12 +1444,8 @@ impl MimeFactory {
         &self,
         context: &Context,
     ) -> Result<Option<(MimePart<'static>, i64)>> {
-        let Loaded::Message { msg, .. } = &self.loaded else {
-            return Ok(None);
-        };
-
         let Some((kml_content, last_added_location_timestamp)) =
-            location::get_kml(context, msg.chat_id).await?
+            location::get_kml(context, self.msg.chat_id).await?
         else {
             return Ok(None);
         };
@@ -1637,50 +1462,10 @@ impl MimeFactory {
         grpimage: &Option<String>,
         is_encrypted: bool,
     ) -> Result<RenderedMessage> {
-        let Loaded::Message { chat, msg } = &self.loaded else {
-            bail!("Attempt to render MDN as a message");
-        };
-        let chat = chat.clone();
-        let msg = msg.clone();
+        let chat = self.chat.clone();
+        let msg = self.msg.clone();
         let command = msg.param.get_cmd();
         let mut placeholdertext = None;
-
-        let send_verified_headers = match chat.typ {
-            Chattype::Single => true,
-            Chattype::Group => true,
-            // Mailinglists and broadcast channels can actually never be verified:
-            Chattype::Mailinglist => false,
-            Chattype::OutBroadcast | Chattype::InBroadcast => false,
-        };
-
-        if send_verified_headers {
-            let was_protected: bool = context
-                .sql
-                .query_get_value("SELECT protected FROM chats WHERE id=?", (chat.id,))
-                .await?
-                .unwrap_or_default();
-
-            if was_protected {
-                let unverified_member_exists = context
-                    .sql
-                    .exists(
-                        "SELECT COUNT(*)
-                        FROM contacts, chats_contacts
-                        WHERE chats_contacts.contact_id=contacts.id AND chats_contacts.chat_id=?
-                        AND contacts.id>9
-                        AND contacts.verifier=0",
-                        (chat.id,),
-                    )
-                    .await?;
-
-                if !unverified_member_exists {
-                    headers.push((
-                        "Chat-Verified",
-                        mail_builder::headers::raw::Raw::new("1").into(),
-                    ));
-                }
-            }
-        }
 
         if chat.typ == Chattype::Group {
             // Send group ID unless it is an ad hoc group that has no ID.
@@ -2214,73 +1999,17 @@ impl MimeFactory {
         })
     }
 
-    /// Render an MDN
-    fn render_mdn(&mut self) -> Result<MimePart<'static>> {
-        // RFC 6522, this also requires the `report-type` parameter which is equal
-        // to the MIME subtype of the second body part of the multipart/report
-        let Loaded::Mdn {
-            rfc724_mid,
-            additional_msg_ids,
-        } = &self.loaded
-        else {
-            bail!("Attempt to render a message as MDN");
-        };
-
-        // first body part: always human-readable, always REQUIRED by RFC 6522.
-        // untranslated to no reveal sender's language.
-        // moreover, translations in unknown languages are confusing, and clients may not display them at all
-        let text_part = MimePart::new("text/plain", "This is a receipt notification.");
-
-        let mut message = MimePart::new(
-            "multipart/report; report-type=disposition-notification",
-            vec![text_part],
-        );
-
-        // second body part: machine-readable, always REQUIRED by RFC 6522
-        //
-        // We do not include the Final-Recipient field.
-        // According to <https://datatracker.ietf.org/doc/html/rfc8098#section-3.2.4>
-        // it MUST be present and be the address on which original message was received,
-        // but practically it is not going to be used.
-        let message_text2 = format!(
-            "Original-Message-ID: <{rfc724_mid}>\r\n\
-             Disposition: manual-action/MDN-sent-automatically; displayed\r\n",
-        );
-
-        let extension_fields = if additional_msg_ids.is_empty() {
-            "".to_string()
-        } else {
-            "Additional-Message-IDs: ".to_string()
-                + &additional_msg_ids
-                    .iter()
-                    .map(|mid| render_rfc724_mid(mid))
-                    .collect::<Vec<String>>()
-                    .join(" ")
-                + "\r\n"
-        };
-
-        message.add_part(MimePart::new(
-            "message/disposition-notification",
-            message_text2 + &extension_fields,
-        ));
-
-        Ok(message)
-    }
-
     pub fn will_be_encrypted(&self) -> bool {
-        match self.encryption {
-            Encryption::No => false,
-            Encryption::Asymmetric { .. } | Encryption::Symmetric { .. } => true,
-        }
+        self.encryption.is_encrypted()
     }
 
     pub fn set_as_post_message(&mut self) {
         self.pre_message_mode = PreMessageMode::Post;
     }
 
-    pub fn set_as_pre_message_for(&mut self, post_message: &RenderedEmail) {
+    pub fn set_as_pre_message_for(&mut self, rfc724_mid: &str) {
         self.pre_message_mode = PreMessageMode::Pre {
-            post_msg_rfc724_mid: post_message.rfc724_mid.clone(),
+            post_msg_rfc724_mid: rfc724_mid.to_string(),
         };
     }
 }
@@ -2299,20 +2028,26 @@ pub(crate) fn wrap_encrypted_part(encrypted: String) -> MimePart<'static> {
     )
 }
 
+fn add_headers_to_part(
+    message: MimePart<'static>,
+    headers: Vec<(&'static str, HeaderType<'static>)>,
+) -> MimePart<'static> {
+    headers
+        .into_iter()
+        .fold(message, |message, (header, value)| {
+            debug_assert_ne!(header, "from");
+            debug_assert_ne!(header, "message-id");
+            debug_assert_ne!(header, "autocrypt");
+            message.header(header, value)
+        })
+}
+
 fn add_headers_to_encrypted_part(
     message: MimePart<'static>,
     protected_headers: Vec<(&'static str, HeaderType<'static>)>,
 ) -> MimePart<'static> {
     // Store protected headers in the inner message.
-    let mut message: MimePart<'static> =
-        protected_headers
-            .into_iter()
-            .fold(message, |message, (header, value)| {
-                debug_assert_ne!(header, "from");
-                debug_assert_ne!(header, "message-id");
-                debug_assert_ne!(header, "autocrypt");
-                message.header(header, value)
-            });
+    let mut message = add_headers_to_part(message, protected_headers);
 
     // Set the appropriate Content-Type for the inner message
     for (h, v) in &mut message.headers {
@@ -2458,29 +2193,15 @@ async fn non_chat_headers(
     Ok(headers)
 }
 
-/// Renders `queued_mail` for SMTP with the own key pair and primary address.
-async fn render_with_self_key(context: &Context, queued_mail: QueuedMail) -> Result<String> {
-    let public_key = key::load_self_public_key(context).await?;
-    let secret_key = key::load_self_secret_key(context).await?;
-    let from_addr = context.get_primary_self_addr().await?;
-    let rendered_mail = render_queued_mail(
-        queued_mail,
-        &public_key,
-        &secret_key,
-        from_addr,
-        RenderSideEffects::default(),
-    )?;
-    Ok(rendered_mail.message)
-}
-
-pub(crate) async fn render_symm_encrypted_securejoin_message(
+pub(crate) async fn symm_encrypted_securejoin_message(
     context: &Context,
     step: &str,
     rfc724_mid: &str,
     should_attach_pubkey: bool,
     auth: &str,
     shared_secret: &str,
-) -> Result<String> {
+    recipients: Vec<String>,
+) -> Result<QueuedMail> {
     info!(context, "Sending secure-join message {step:?}.");
 
     let message: MimePart<'static> = MimePart::new("text/plain", "Secure-Join");
@@ -2495,7 +2216,7 @@ pub(crate) async fn render_symm_encrypted_securejoin_message(
         raw_message: part_to_bytes(message),
         display_name: String::new(),
         rfc724_mid: rfc724_mid.to_string(),
-        encryption: Encryption::Symmetric {
+        encryption: QueuedEncryption::Symmetric {
             shared_secret: shared_secret.to_string(),
         },
         should_attach_pubkey,
@@ -2505,9 +2226,134 @@ pub(crate) async fn render_symm_encrypted_securejoin_message(
         // there are no compression side channels
         // leaking information about the tokens.
         should_compress: false,
+        recipients,
+        sent_to: Vec::new(),
+        // Never send a copy of SecureJoin message to self.
+        bcc_self: false,
     };
 
-    render_with_self_key(context, queued_mail).await
+    Ok(queued_mail)
+}
+
+/// Returns an MDN body.
+fn mdn_body(rfc724_mid: &str, additional_msg_ids: Vec<String>) -> MimePart<'static> {
+    // RFC 6522, this also requires the `report-type` parameter which is equal
+    // to the MIME subtype of the second body part of the multipart/report
+
+    // first body part: always human-readable, always REQUIRED by RFC 6522.
+    // untranslated to no reveal sender's language.
+    // moreover, translations in unknown languages are confusing, and clients may not display them at all
+    let text_part = MimePart::new("text/plain", "This is a receipt notification.");
+
+    // second body part: machine-readable, always REQUIRED by RFC 6522
+    //
+    // We do not include the Final-Recipient field.
+    // According to <https://datatracker.ietf.org/doc/html/rfc8098#section-3.2.4>
+    // it MUST be present and be the address on which original message was received,
+    // but practically it is not going to be used.
+    let message_text2 = format!(
+        "Original-Message-ID: <{rfc724_mid}>\r\n\
+         Disposition: manual-action/MDN-sent-automatically; displayed\r\n",
+    );
+
+    let extension_fields = if additional_msg_ids.is_empty() {
+        "".to_string()
+    } else {
+        "Additional-Message-IDs: ".to_string()
+            + &additional_msg_ids
+                .iter()
+                .map(|mid| render_rfc724_mid(mid))
+                .collect::<Vec<String>>()
+                .join(" ")
+            + "\r\n"
+    };
+
+    MimePart::new(
+        "multipart/report; report-type=disposition-notification",
+        vec![
+            text_part,
+            MimePart::new(
+                "message/disposition-notification",
+                message_text2 + &extension_fields,
+            ),
+        ],
+    )
+}
+
+pub(crate) async fn mdn(
+    context: &Context,
+    contact_id: ContactId,
+    rfc724_mid: &str,
+    additional_rfc724_mids: Vec<String>,
+) -> Result<QueuedMail> {
+    let contact = Contact::get_by_id(context, contact_id).await?;
+    let timestamp = time();
+
+    let addr = contact.get_addr().to_string();
+    let recipients: Vec<String>;
+    let encryption_pubkeys = if contact_id == ContactId::SELF {
+        recipients = Vec::new();
+        Vec::new()
+    } else if let Some(key) = contact.public_key(context).await? {
+        recipients = relay_addrs(&key, &addr);
+        vec![key]
+    } else {
+        warn!(context, "Contact {contact_id} has no key, sending to self.");
+        // Encryption key for the contact is not available, sending MDN to self only.
+        recipients = Vec::new();
+        Vec::new()
+    };
+    let bcc_self = context.get_config_bool(Config::BccSelf).await?;
+
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
+        .context("Failed to convert timestamp to DateTime")?
+        .to_rfc2822();
+    let headers: Vec<(&'static str, HeaderType<'static>)> = vec![
+        ("Date", mail_builder::headers::raw::Raw::new(date).into()),
+        (
+            "To",
+            mail_builder::headers::address::Address::new_list(vec![Address::new_address(
+                None::<&'static str>,
+                contact.get_addr().to_string(),
+            )])
+            .into(),
+        ),
+        // Subject is untranslated to not reveal sender's language.
+        (
+            "Subject",
+            mail_builder::headers::text::Text::new("Receipt Notification".to_string()).into(),
+        ),
+        // Automatic Response headers <https://www.rfc-editor.org/rfc/rfc3834>
+        (
+            "Auto-Submitted",
+            mail_builder::headers::raw::Raw::new("auto-replied".to_string()).into(),
+        ),
+        (
+            "Chat-Version",
+            mail_builder::headers::raw::Raw::new("1.0").into(),
+        ),
+    ];
+
+    let message = mdn_body(rfc724_mid, additional_rfc724_mids);
+    let should_attach_pubkey =
+        MimeFactory::update_mdn_pubkey_attachment(context, &encryption_pubkeys).await?;
+    let message = add_headers_to_encrypted_part(message, headers);
+    let raw_message = part_to_bytes(message);
+
+    let encryption = QueuedEncryption::Asymmetric { encryption_pubkeys };
+    let queued_mdn = QueuedMail {
+        raw_message,
+        rfc724_mid: create_outgoing_rfc724_mid(),
+        display_name: String::new(),
+        encryption,
+        should_attach_pubkey,
+        should_sign: true,
+        should_compress: true,
+        recipients,
+        sent_to: Vec::new(),
+        bcc_self,
+    };
+    Ok(queued_mdn)
 }
 
 /// Returns the body of a keyupdate message, shaped like a receipt notification.
@@ -2517,7 +2363,7 @@ pub(crate) async fn render_symm_encrypted_securejoin_message(
 /// while a plain text body would end up in a contact request.
 /// The report deliberately names no original message, see [`crate::keyupdate`].
 fn keyupdate_body() -> MimePart<'static> {
-    // Human-readable first part as RFC 6522 requires, untranslated like in `render_mdn`.
+    // Human-readable first part as RFC 6522 requires.
     let text_part = MimePart::new(
         "text/plain",
         "This message updates the sender's encryption key and relay list.",
@@ -2536,13 +2382,14 @@ fn keyupdate_body() -> MimePart<'static> {
     )
 }
 
-/// Renders a keyupdate message informing the owners of `recipient_keys`
+/// Returns a keyupdate message informing the owners of `recipient_keys`
 /// about the current key and relay list, see [`crate::keyupdate`].
-pub(crate) async fn render_keyupdate_message(
+pub(crate) async fn keyupdate_message(
     context: &Context,
     rfc724_mid: &str,
     recipient_keys: Vec<SignedPublicKey>,
-) -> Result<String> {
+    recipients: Vec<String>,
+) -> Result<QueuedMail> {
     info!(
         context,
         "Sending keyupdate message to {} recipients.",
@@ -2557,11 +2404,8 @@ pub(crate) async fn render_keyupdate_message(
         raw_message: part_to_bytes(message),
         display_name: String::new(),
         rfc724_mid: rfc724_mid.to_string(),
-        encryption: Encryption::Asymmetric {
-            encryption_pubkeys: recipient_keys
-                .into_iter()
-                .map(|key| (String::new(), key))
-                .collect(),
+        encryption: QueuedEncryption::Asymmetric {
+            encryption_pubkeys: recipient_keys,
         },
 
         // Attached key with its relay list notation is the actual payload.
@@ -2573,16 +2417,17 @@ pub(crate) async fn render_keyupdate_message(
 
         // Disable compression to avoid side channels, message body is small anyway.
         should_compress: false,
+        recipients,
+        sent_to: Vec::new(),
+        bcc_self: false,
     };
-
-    render_with_self_key(context, queued_mail).await
+    Ok(queued_mail)
 }
 
 /// Renders MIME part into a vector of bytes.
 pub(crate) fn part_to_bytes(message: MimePart<'static>) -> Vec<u8> {
     let mut raw_message = Vec::new();
-    let cursor = Cursor::new(&mut raw_message);
-    message.write_part(cursor).ok();
+    message.write_part(&mut raw_message);
     raw_message
 }
 

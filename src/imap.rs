@@ -19,6 +19,7 @@ use async_imap::types::{Fetch, Flag, UnsolicitedResponse};
 use futures::{FutureExt as _, TryStreamExt};
 use futures_lite::FutureExt;
 use ratelimit::Ratelimit;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::chat::{self, add_device_msg};
@@ -104,6 +105,10 @@ pub(crate) struct Imap {
 
     /// IMAP UID resync request receiver.
     pub(crate) resync_request_receiver: async_channel::Receiver<()>,
+
+    /// The background fetch is cancelled once messages are fetched from one of the transports,
+    /// so that the other transports fetch nothing.
+    pub(crate) background_fetch_stop_token: Option<CancellationToken>,
 }
 
 #[derive(Debug, Default)]
@@ -124,6 +129,8 @@ pub(crate) struct ServerMetadata {
     /// True if we think the relay supports push notifications.
     /// This gates wether we attempt to write an encrypted device token
     /// to per-transport IMAP metadata key `/private/devicetoken`.
+    ///
+    /// Any `/shared/vendor/deltachat/` entry identifies a chatmail relay.
     pub supports_push: bool,
 
     /// ICE servers for WebRTC calls.
@@ -237,19 +244,8 @@ impl Imap {
             ratelimit: Ratelimit::new(Duration::new(120, 0), 2.0),
             resync_request_sender,
             resync_request_receiver,
+            background_fetch_stop_token: None,
         })
-    }
-
-    /// Creates new disconnected IMAP client using configured parameters.
-    pub async fn new_configured(
-        context: &Context,
-        idle_interrupt_receiver: Receiver<()>,
-    ) -> Result<Self> {
-        let (transport_id, param) = ConfiguredLoginParam::load(context)
-            .await?
-            .context("Not configured")?;
-        let imap = Self::new(context, transport_id, param, idle_interrupt_receiver).await?;
-        Ok(imap)
     }
 
     /// Returns transport ID of the IMAP client.
@@ -305,7 +301,8 @@ impl Imap {
         self.conn_backoff_ms = max(BACKOFF_MIN_MS, self.conn_backoff_ms);
 
         let login_params = prioritize_server_login_params(&context.sql, &self.lp, "imap").await?;
-        let mut first_error = None;
+        let mut first_connection_error = None;
+        let mut first_login_error = None;
         'candidate: for lp in login_params {
             info!(context, "IMAP trying to connect to {}.", lp.connection);
             let connection_candidate = lp.connection.clone();
@@ -321,7 +318,7 @@ impl Imap {
                 Ok(client) => client,
                 Err(err) => {
                     warn!(context, "{err:#}.");
-                    first_error.get_or_insert(err);
+                    first_connection_error.get_or_insert(err);
                     continue 'candidate;
                 }
             };
@@ -400,12 +397,14 @@ impl Imap {
 
                 Err(err) => {
                     warn!(context, "{err:#}.");
-                    first_error.get_or_insert(err);
+                    first_login_error.get_or_insert(err);
                 }
             }
         }
 
-        Err(first_error.unwrap_or_else(|| format_err!("No IMAP connection candidates provided")))
+        Err(first_login_error
+            .or(first_connection_error)
+            .unwrap_or_else(|| format_err!("No IMAP connection candidates provided")))
     }
 
     /// Prepare a new IMAP session.
@@ -424,16 +423,18 @@ impl Imap {
         Ok(session)
     }
 
-    /// FETCH-MOVE-DELETE iteration.
+    /// FETCH-and-DELETE iteration.
     ///
-    /// Prefetches headers and downloads new message from the folder, moves messages away from the
-    /// folder and deletes messages in the folder.
-    pub async fn fetch_move_delete(
+    /// Prefetches headers and downloads new message from the folder
+    /// and deletes messages in the folder.
+    ///
+    /// Returns true if at least one message was fetched.
+    pub async fn fetch_delete(
         &mut self,
         context: &Context,
         session: &mut Session,
         watch_folder: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         ensure_and_debug_assert!(!watch_folder.is_empty(), "Watched folder cannot be empty");
         if !context.sql.is_open().await {
             // probably shutdown
@@ -454,16 +455,16 @@ impl Imap {
 
         // Mark expired messages for deletion. Note that `delete_expired_imap_messages` is
         // not well optimized and should not be called before fetching.
-        delete_expired_imap_messages(context, session.transport_id(), session.is_chatmail())
+        delete_expired_imap_messages(context, session.transport_id())
             .await
             .context("delete_expired_imap_messages")?;
 
         session
-            .move_delete_messages(context, watch_folder)
+            .delete_messages(context, watch_folder)
             .await
-            .context("move_delete_messages")?;
+            .context("delete_messages")?;
 
-        Ok(())
+        Ok(msgs_fetched)
     }
 
     /// Fetches new messages.
@@ -532,6 +533,19 @@ impl Imap {
             .context("prefetch")?;
         let read_cnt = msgs.len();
         let _fetch_msgs_lock_guard = context.fetch_msgs_mutex.lock().await;
+        if let Some(stop_token) = &self.background_fetch_stop_token {
+            if stop_token.is_cancelled() {
+                // This also stops the transport that cancelled the token,
+                // so one background fetch receives at most `uids_to_prefetch` messages.
+                return Ok((0, false));
+            }
+            if read_cnt > 0 {
+                // Cancel the background fetch on the other transports,
+                // so that `background_fetch_any()` can return as soon as messages are received
+                // and the UI can show a notification.
+                stop_token.cancel();
+            }
+        }
 
         let mut uids_fetch: Vec<u32> = Vec::new();
         let mut available_post_msgs: Vec<String> = Vec::new();
@@ -559,16 +573,6 @@ impl Imap {
                 .size
                 .context("imap fetch response does not contain size")?;
 
-            // Determine the target folder where the message should be moved to.
-            //
-            // We only move the messages from the INBOX and Spam folders.
-            // This is required to avoid infinite MOVE loop on IMAP servers
-            // that alias `DeltaChat` folder to other names.
-            // For example, some Dovecot servers alias `DeltaChat` folder to `INBOX.DeltaChat`.
-            // In this case moving from `INBOX.DeltaChat` to `DeltaChat`
-            // results in the messages getting a new UID,
-            // so the messages will be detected as new
-            // in the `INBOX.DeltaChat` folder again.
             let delete = if let Some(message_id) = &message_id {
                 message::rfc724_mid_exists_ext(context, message_id, "deleted=1")
                     .await?
@@ -606,13 +610,7 @@ impl Imap {
                 )
                 .await?;
 
-            // Download only the messages which have reached their target folder if there are
-            // multiple devices. This prevents race conditions in multidevice case, where one
-            // device tries to download the message while another device moves the message at the
-            // same time. Even in single device case it is possible to fail downloading the first
-            // message, move it to the movebox and then download the second message before
-            // downloading the first one, if downloading from inbox before moving is allowed.
-            if folder == target
+            if !delete
                 && prefetch_should_download(context, &headers, &message_id, fetch_response.flags())
                     .await
                     .context("prefetch_should_download")?
@@ -849,75 +847,10 @@ impl Session {
         Ok(())
     }
 
-    /// Moves batch of messages identified by their UID from the currently
-    /// selected folder to the target folder.
-    async fn move_message_batch(
-        &mut self,
-        context: &Context,
-        set: &str,
-        row_ids: Vec<i64>,
-        target: &str,
-    ) -> Result<()> {
-        if self.can_move() {
-            match self.uid_mv(set, &target).await {
-                Ok(()) => {
-                    // Messages are moved or don't exist, IMAP returns OK response in both cases.
-                    context
-                        .sql
-                        .transaction(|transaction| {
-                            let mut stmt = transaction.prepare("DELETE FROM imap WHERE id = ?")?;
-                            for row_id in row_ids {
-                                stmt.execute((row_id,))?;
-                            }
-                            Ok(())
-                        })
-                        .await
-                        .context("Cannot delete moved messages from imap table")?;
-                    context.emit_event(EventType::ImapMessageMoved(format!(
-                        "IMAP messages {set} moved to {target}"
-                    )));
-                    return Ok(());
-                }
-                Err(err) => {
-                    warn!(
-                        context,
-                        "Cannot move messages, fallback to COPY/DELETE {} to {}: {}",
-                        set,
-                        target,
-                        err
-                    );
-                }
-            }
-        }
-
-        // Server does not support MOVE or MOVE failed.
-        // Copy messages to the destination folder if needed and mark records for deletion.
-        info!(
-            context,
-            "Server does not support MOVE, fallback to COPY/DELETE {} to {}", set, target
-        );
-        self.uid_copy(&set, &target).await?;
-        context
-            .sql
-            .transaction(|transaction| {
-                let mut stmt = transaction.prepare("UPDATE imap SET target='' WHERE id = ?")?;
-                for row_id in row_ids {
-                    stmt.execute((row_id,))?;
-                }
-                Ok(())
-            })
-            .await
-            .context("Cannot plan deletion of messages")?;
-        context.emit_event(EventType::ImapMessageMoved(format!(
-            "IMAP messages {set} copied to {target}"
-        )));
-        Ok(())
-    }
-
-    /// Moves and deletes messages as planned in the `imap` table.
+    /// Deletes messages as planned in the `imap` table.
     ///
-    /// This is the only place where messages are moved or deleted on the IMAP server.
-    async fn move_delete_messages(&mut self, context: &Context, folder: &str) -> Result<()> {
+    /// This is the only place where messages are deleted on the IMAP server.
+    async fn delete_messages(&mut self, context: &Context, folder: &str) -> Result<()> {
         let transport_id = self.transport_id();
         let rows = context
             .sql
@@ -939,23 +872,21 @@ impl Session {
 
         for (target, rowid_set, uid_set) in UidGrouper::from(rows) {
             // Select folder inside the loop to avoid selecting it if there are no pending
-            // MOVE/DELETE operations. This does not result in multiple SELECT commands
+            // DELETE operations. This does not result in multiple SELECT commands
             // being sent because `select_folder()` does nothing if the folder is already
             // selected.
             let folder_exists = self.select_with_uidvalidity(context, folder).await?;
             ensure!(folder_exists, "No folder {folder}");
 
             // Empty target folder name means messages should be deleted.
+            // Since we don't move messages between IMAP folders anymore,
+            // `target` is always either empty or equal to `folder`.
+            debug_assert!(target.is_empty() || folder == target);
+
             if target.is_empty() {
                 self.delete_message_batch(context, &uid_set, rowid_set)
                     .await
                     .with_context(|| format!("cannot delete batch of messages {uid_set:?}"))?;
-            } else {
-                self.move_message_batch(context, &uid_set, rowid_set, &target)
-                    .await
-                    .with_context(|| {
-                        format!("cannot move batch of messages {uid_set:?} to folder {target:?}",)
-                    })?;
             }
         }
 
@@ -1375,6 +1306,8 @@ impl Session {
                 _ => {}
             }
         }
+        let supports_push =
+            max_smtp_rcpt_to.is_some() || iroh_relay.is_some() || ice_servers.is_some();
         let ice_servers = if let Some(ice_servers) = ice_servers {
             ice_servers
         } else {
@@ -1390,7 +1323,7 @@ impl Session {
                 admin,
                 iroh_relay,
                 max_smtp_rcpt_to,
-                supports_push: max_smtp_rcpt_to.is_some() || self.capabilities.has_xdeltapush,
+                supports_push,
                 ice_servers,
                 ice_servers_expiration_timestamp,
                 app_versions,
@@ -1521,10 +1454,9 @@ impl Session {
     /// or flags have been changed.
     /// In this case we may want to skip next IDLE and do a round
     /// of fetching new messages and synchronizing seen flags.
-    fn drain_unsolicited_responses(&self, context: &Context) -> Result<bool> {
+    fn drain_unsolicited_responses(&self, context: &Context) -> bool {
         use UnsolicitedResponse::*;
         use async_imap::imap_proto::Response;
-        use async_imap::imap_proto::ResponseCode;
 
         let folder = self.selected_folder.as_deref().unwrap_or_default();
         let mut should_refetch = false;
@@ -1539,34 +1471,25 @@ impl Session {
                 }
 
                 Expunge(_) | Recent(_) => {}
-                Other(ref response_data) => {
-                    match response_data.parsed() {
-                        Response::Fetch { .. } => {
-                            info!(
-                                context,
-                                "Need to refetch {folder:?}, got unsolicited FETCH {response:?}"
-                            );
-                            should_refetch = true;
-                        }
-
-                        // We are not interested in the following responses and they are are
-                        // sent quite frequently, so, we ignore them without logging them.
-                        Response::Done {
-                            code: Some(ResponseCode::CopyUid(_, _, _)),
-                            ..
-                        } => {}
-
-                        _ => {
-                            info!(context, "{folder:?}: got unsolicited response {response:?}")
-                        }
+                Other(ref response_data) => match response_data.parsed() {
+                    Response::Fetch { .. } => {
+                        info!(
+                            context,
+                            "Need to refetch {folder:?}, got unsolicited FETCH {response:?}"
+                        );
+                        should_refetch = true;
                     }
-                }
+
+                    _ => {
+                        info!(context, "{folder:?}: got unsolicited response {response:?}")
+                    }
+                },
                 _ => {
                     info!(context, "{folder:?}: got unsolicited response {response:?}")
                 }
             }
         }
-        Ok(should_refetch)
+        should_refetch
     }
 }
 

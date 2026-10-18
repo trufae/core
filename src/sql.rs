@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::context::Context;
 use crate::debug_logging::set_debug_logging_xdc;
 use crate::ephemeral::start_ephemeral_timers;
-use crate::imex::BLOBS_BACKUP_NAME;
+use crate::imex::{self, BLOBS_BACKUP_NAME};
 use crate::location;
 use crate::log::{LogExt, warn};
 use crate::message::MsgId;
@@ -741,6 +741,11 @@ fn new_connection(path: &Path, passphrase: &str) -> Result<Connection> {
     // Default synchronous=FULL is much slower. NORMAL is sufficient for WAL mode.
     conn.pragma_update(None, "synchronous", "NORMAL".to_string())?;
 
+    // Disable double-quoted string literals misfeature.
+    // <https://sqlite.org/quirks.html#double_quoted_string_literals_are_accepted>
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, false)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)?;
+
     Ok(conn)
 }
 
@@ -821,6 +826,12 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
             "Housekeeping: Cannot prune message tombstones: {:#}.", err
         );
     }
+
+    imex::maybe_readd_backup_transfer_msg(context)
+        .await
+        .context("Failed to re-add backup transfer message")
+        .log_err(context)
+        .ok();
 
     if let Err(err) = incremental_vacuum(context).await {
         warn!(context, "Failed to run incremental vacuum: {err:#}.");

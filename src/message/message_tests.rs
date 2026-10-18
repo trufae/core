@@ -454,6 +454,28 @@ async fn test_get_state() -> Result<()> {
     Ok(())
 }
 
+/// Tests that a failure reported after a read receipt leaves the message untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_set_msg_failed_after_mdn() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let alice_chat = alice.create_chat(bob).await;
+    let sent = alice.send_text(alice_chat.id, "hi").await;
+    let bob_msg = bob.recv_msg(&sent).await;
+    alice.recv_mdn(bob, &bob_msg).await?;
+    let mut msg = sent.load_from_db().await;
+    assert_eq!(msg.state, MessageState::OutMdnRcvd);
+
+    set_msg_failed(alice, &mut msg, "relay bounced").await?;
+    let msg = sent.load_from_db().await;
+    assert_eq!(msg.state, MessageState::OutMdnRcvd);
+    assert_eq!(msg.error(), None);
+    let chats = Chatlist::try_load(alice, 0, None, None).await?;
+    assert_eq!(chats.get_msg_id(0)?, Some(msg.id));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_is_bot() -> Result<()> {
     let mut tcm = TestContextManager::new();
@@ -626,10 +648,14 @@ async fn test_delete_msgs_offline() -> Result<()> {
     let chat_id = alice.create_chat_id(bob).await;
     let mut msg = Message::new_text("hi".to_string());
     assert!(chat::send_msg_sync(alice, chat_id, &mut msg).await.is_err());
-    let stmt = "SELECT COUNT(*) FROM smtp WHERE msg_id=?";
+    let stmt = "SELECT COUNT(*) FROM smtp2 WHERE msg_id=?";
     assert!(alice.sql.exists(stmt, (msg.id,)).await?);
     delete_msgs(alice, &[msg.id]).await?;
     assert!(!alice.sql.exists(stmt, (msg.id,)).await?);
+
+    alice
+        .assert_warn("No SMTP connection candidates provided")
+        .await;
 
     Ok(())
 }
@@ -755,4 +781,22 @@ async fn test_get_existing_msg_ids() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[test]
+fn test_can_fail() {
+    use MessageState::*;
+
+    // states that are not allowed to transition to OutFailed
+    assert!(!Undefined.can_fail());
+    assert!(!InFresh.can_fail());
+    assert!(!InNoticed.can_fail());
+    assert!(!InSeen.can_fail());
+    assert!(!OutDraft.can_fail());
+    assert!(!OutMdnRcvd.can_fail());
+
+    // states that are allowed to transition to OutFailed
+    assert!(OutPending.can_fail());
+    assert!(OutDelivered.can_fail());
+    assert!(OutFailed.can_fail());
 }

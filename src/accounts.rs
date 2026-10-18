@@ -26,6 +26,7 @@ use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::location;
 use crate::log::warn;
 use crate::push::PushSubscriber;
+use crate::smtp;
 use crate::stock_str::StockStrings;
 
 /// Account manager, that can handle multiple accounts in a single place.
@@ -75,12 +76,8 @@ impl Accounts {
         Accounts::open(events, dir, writable).await
     }
 
-    /// Get the ID used to log events.
-    ///
-    /// Account manager logs events with ID 0
-    /// which is not used by any accounts.
-    fn get_id(&self) -> u32 {
-        0
+    fn log_info(&self, file: &str, line: u32, msg: String) {
+        self.emit_event(EventType::Info(format!("{file}:{line}: {msg}")));
     }
 
     /// Ensures the accounts directory and config file exist.
@@ -394,11 +391,6 @@ impl Accounts {
                 "Starting background fetch for {n_accounts} accounts."
             )),
         });
-        ::tracing::event!(
-            ::tracing::Level::INFO,
-            account_id = 0,
-            "Starting background fetch for {n_accounts} accounts."
-        );
         let mut set = JoinSet::new();
         for account in accounts {
             set.spawn(async move {
@@ -414,11 +406,6 @@ impl Accounts {
                 "Finished background fetch for {n_accounts} accounts."
             )),
         });
-        ::tracing::event!(
-            ::tracing::Level::INFO,
-            account_id = 0,
-            "Finished background fetch for {n_accounts} accounts."
-        );
     }
 
     /// Auxiliary function for [Accounts::background_fetch].
@@ -442,7 +429,12 @@ impl Accounts {
         interrupt_receiver: Option<Receiver<()>>,
     ) {
         let Some(interrupt_receiver) = interrupt_receiver else {
-            // Nothing to do if we got no interrupt receiver.
+            // Another background fetch is already running.
+            // Emit the event anyway so that a caller waiting for it does not hang.
+            events.emit(Event {
+                id: 0,
+                typ: EventType::AccountsBackgroundFetchDone,
+            });
             return;
         };
         if let Err(_err) = tokio::time::timeout(
@@ -456,11 +448,6 @@ impl Accounts {
                 id: 0,
                 typ: EventType::Warning("Background fetch timed out.".to_string()),
             });
-            ::tracing::event!(
-                ::tracing::Level::WARN,
-                account_id = 0,
-                "Background fetch timed out."
-            );
         }
         events.emit(Event {
             id: 0,
@@ -476,9 +463,15 @@ impl Accounts {
     /// return immediately even before the timeout expiration
     /// or finishing fetching.
     ///
+    /// Pending outgoing messages are not waited for and not triggered.
+    ///
     /// The `AccountsBackgroundFetchDone` event is emitted at the end,
     /// process all events until you get this one and you can safely return to the background
     /// without forgetting to create notifications caused by timing race conditions.
+    /// If another background fetch is already running,
+    /// nothing is fetched and the event is emitted immediately.
+    /// The event carries no data identifying the call it belongs to,
+    /// so it only safely refers to your call if no concurrent background fetch is happening.
     ///
     /// Returns a future that resolves when background fetch is done,
     /// but does not capture `&self`.
@@ -509,6 +502,20 @@ impl Accounts {
         )
     }
 
+    /// Returns true if there are no pending messages for sending.
+    ///
+    /// This is intended to be used by UIs to request not moving the app to background
+    /// when there are messages left in the queue.
+    pub async fn is_sending_finished(&self) -> Result<bool> {
+        let accounts: Vec<Context> = self.accounts.values().cloned().collect();
+        for account in accounts {
+            if !smtp::queue::is_empty(&account).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Interrupts ongoing background_fetch() call,
     /// making it return early.
     ///
@@ -523,7 +530,7 @@ impl Accounts {
         }
     }
 
-    /// Emits a single event.
+    /// Emits a single event with ID 0, which is not used by any accounts.
     pub fn emit_event(&self, event: EventType) {
         self.events.emit(Event { id: 0, typ: event })
     }
@@ -1220,6 +1227,29 @@ mod tests {
         // When account manager is dropped, event emitter is exhausted.
         drop(accounts);
         assert_eq!(event_emitter.recv().await, None);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_background_fetch_emits_done_when_already_running() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let writable = true;
+        let accounts = Accounts::new(dir.path().join("accounts"), writable).await?;
+        let event_emitter = accounts.get_event_emitter();
+
+        let timeout = std::time::Duration::from_secs(3);
+        let first = accounts.background_fetch(timeout);
+        let second = accounts.background_fetch(timeout);
+        tokio::join!(first, second);
+
+        let mut done = 0;
+        while let Ok(event) = event_emitter.try_recv() {
+            if matches!(event.typ, EventType::AccountsBackgroundFetchDone) {
+                done += 1;
+            }
+        }
+        assert_eq!(done, 2);
 
         Ok(())
     }

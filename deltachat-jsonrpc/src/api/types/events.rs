@@ -44,9 +44,6 @@ pub enum EventType {
     /// Emitted when an IMAP message has been marked as deleted
     ImapMessageDeleted { msg: String },
 
-    /// Emitted when an IMAP message has been moved
-    ImapMessageMoved { msg: String },
-
     /// Emitted before going into IDLE on the Inbox folder.
     ImapInboxIdle,
 
@@ -261,6 +258,15 @@ pub enum EventType {
         chat_id: u32,
     },
 
+    /// The list of pinned messages for the chat has changed.
+    ///
+    /// Some message got pinned, or pinned message is unpinned or deleted.
+    #[serde(rename_all = "camelCase")]
+    PinnedMessagesChanged {
+        /// ID of the chat where the list of pinned messages changed.
+        chat_id: u32,
+    },
+
     /// Contact(s) created, renamed, blocked or deleted.
     #[serde(rename_all = "camelCase")]
     ContactsChanged {
@@ -337,8 +343,7 @@ pub enum EventType {
         contact_id: u32,
 
         /// Progress as:
-        /// 400=vg-/vc-request-with-auth sent, typically shown as "alice@addr verified, introducing myself."
-        /// (Bob has verified alice and waits until Alice does the same for him)
+        /// 400=vg-/vc-request-with-auth sent, typically shown as "introducing myself."
         /// 1000=vg-member-added/vc-contact-confirm received
         progress: u16,
     },
@@ -394,11 +399,15 @@ pub enum EventType {
         msg_id: u32,
     },
 
-    /// Tells that the Background fetch was completed (or timed out).
-    /// This event acts as a marker, when you reach this event you can be sure
-    /// that all events emitted during the background fetch were processed.
+    /// Tells that a background fetch call is done:
+    /// the fetch completed, timed out, was stopped or was not started.
     ///
-    /// This event is only emitted by the account manager
+    /// For the call that started the fetch, this event acts as a marker:
+    /// all events emitted during the fetch were processed once it is reached.
+    /// A call made while another background fetch is running gets the event immediately,
+    /// and the running fetch keeps emitting events until its own marker.
+    ///
+    /// This event is only emitted by the account manager.
     AccountsBackgroundFetchDone,
     /// Inform that set of chats or the order of the chats in the chatlist has changed.
     ///
@@ -493,7 +502,6 @@ impl From<CoreEventType> for EventType {
             CoreEventType::ImapConnected(msg) => ImapConnected { msg },
             CoreEventType::SmtpMessageSent(msg) => SmtpMessageSent { msg },
             CoreEventType::ImapMessageDeleted(msg) => ImapMessageDeleted { msg },
-            CoreEventType::ImapMessageMoved(msg) => ImapMessageMoved { msg },
             CoreEventType::ImapInboxIdle => ImapInboxIdle,
             CoreEventType::NewBlobFile(file) => NewBlobFile { file },
             CoreEventType::DeletedBlobFile(file) => DeletedBlobFile { file },
@@ -512,6 +520,9 @@ impl From<CoreEventType> for EventType {
                 chat_id: chat_id.to_u32(),
                 msg_id: msg_id.to_u32(),
                 contact_id: contact_id.to_u32(),
+            },
+            CoreEventType::PinnedMessagesChanged { chat_id } => PinnedMessagesChanged {
+                chat_id: chat_id.to_u32(),
             },
             CoreEventType::IncomingReaction {
                 chat_id,

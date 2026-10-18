@@ -62,6 +62,13 @@ def pytest_report_header():
     return headers
 
 
+def get_chatmail_domain() -> str:
+    domain = os.environ.get("CHATMAIL_DOMAIN")
+    if not domain:
+        pytest.skip("CHATMAIL_DOMAIN is not configured; online accounts are unavailable")
+    return domain
+
+
 class RPCAccountFactory:
     """Test account factory."""
 
@@ -76,15 +83,15 @@ class RPCAccountFactory:
         """Create a new unconfigured bot."""
         return Bot(self.get_unconfigured_account())
 
-    def get_credentials(self) -> (str, str):
+    def get_credentials(self) -> tuple[str, str]:
         """Generate new credentials for chatmail account."""
-        domain = os.environ["CHATMAIL_DOMAIN"]
+        domain = get_chatmail_domain()
         username = "ci-" + "".join(random.choice("2345789acdefghjkmnpqrstuvwxyz") for i in range(6))
         return f"{username}@{domain}", f"{username}${username}"
 
     def get_account_qr(self):
         """Return "dcaccount:" QR code for testing chatmail relay."""
-        domain = os.environ["CHATMAIL_DOMAIN"]
+        domain = get_chatmail_domain()
         return f"dcaccount:{domain}"
 
     @futuremethod

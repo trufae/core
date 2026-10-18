@@ -32,8 +32,6 @@ fn migrate_key_contacts(
     context: &Context,
     transaction: &mut rusqlite::Transaction<'_>,
 ) -> std::result::Result<(), anyhow::Error> {
-    info!(context, "Starting key-contact transition.");
-
     // =============================== Step 1: ===============================
     //                              Alter tables
     transaction.execute_batch(
@@ -79,12 +77,11 @@ fn migrate_key_contacts(
         .optional()
         .context("Step 0")?
     else {
-        info!(
-            context,
-            "Not yet configured, no need to migrate key-contacts"
-        );
+        // Not yet configured, no need to migrate key-contacts.
         return Ok(());
     };
+
+    info!(context, "Starting key-contact transition.");
 
     // =============================== Step 2: ===============================
     // Create up to 3 new contacts for every contact that has a peerstate:
@@ -1936,14 +1933,9 @@ CREATE INDEX gossip_timestamp_index ON gossip_timestamp (chat_id, fingerprint);
 
     inc_and_check(&mut migration_version, 132)?;
     if dbversion < migration_version {
-        let start = Time::now();
         sql.execute_migration_transaction(|t| migrate_key_contacts(context, t), migration_version)
             .await?;
-        info!(
-            context,
-            "key-contacts migration took {:?} in total.",
-            time_elapsed(&start),
-        );
+
         // Schedule `msgs_to_key_contacts()`.
         context
             .set_config_internal(Config::LastHousekeeping, None)
@@ -2637,6 +2629,74 @@ UPDATE msgs SET state=24 WHERE state=18; -- Change OutPreparing to OutFailed.
                  WHERE is_published=0
                      AND addr!=(SELECT value FROM config WHERE keyname='configured_addr');
              DELETE FROM config WHERE keyname='keyupdate_baseline' AND changes()>0",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 166)?;
+    if dbversion < migration_version {
+        sql.execute_migration(
+            "
+UPDATE msgs
+   SET state=24, -- OutFailed
+       error='Message sending canceled by upgrade'
+   WHERE state=20 AND id IN (SELECT msg_id FROM smtp); -- OutPending
+DELETE FROM smtp;
+CREATE TABLE smtp2 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    display_name TEXT NOT NULL,
+    rfc724_mid TEXT NOT NULL,
+    mime BLOB NOT NULL,
+    should_attach_pubkey INTEGER NOT NULL,
+    should_compress INTEGER NOT NULL,
+    should_sign INTEGER NOT NULL,
+    msg_id INTEGER NOT NULL,
+    recipients TEXT NOT NULL,
+    sent_to TEXT NOT NULL DEFAULT '',
+    bcc_self INTEGER NOT NULL,
+    is_encrypted INTEGER NOT NULL,
+    shared_secret TEXT NOT NULL DEFAULT '',
+    encryption_fingerprints TEXT NOT NULL DEFAULT '',
+    retries INTEGER NOT NULL DEFAULT 0
+) STRICT;",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 167)?;
+    if dbversion < migration_version {
+        // The default relay candidates are no longer seeded into the table.
+        sql.execute_migration("DELETE FROM relay_candidates", migration_version)
+            .await?;
+    }
+
+    inc_and_check(&mut migration_version, 168)?;
+    if dbversion < migration_version {
+        sql.execute_migration(
+            "
+CREATE TABLE smtp_success (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    transport_id INTEGER UNIQUE NOT NULL,
+    FOREIGN KEY(transport_id) REFERENCES transports(id) ON DELETE CASCADE
+) STRICT;
+",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 169)?;
+    if dbversion < migration_version {
+        sql.execute_migration(
+            "
+CREATE TABLE smtp_failure (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    transport_id INTEGER UNIQUE NOT NULL,
+    FOREIGN KEY(transport_id) REFERENCES transports(id) ON DELETE CASCADE
+) STRICT;
+",
             migration_version,
         )
         .await?;

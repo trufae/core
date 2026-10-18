@@ -2,17 +2,18 @@
 
 mod dclogin_scheme;
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 pub use dclogin_scheme::LoginOptions;
 pub(crate) use dclogin_scheme::login_param_from_login_qr;
 use deltachat_contact_tools::{ContactAddress, addr_normalize, may_be_valid_addr};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, percent_encode};
+use regex::regex;
 use serde::Deserialize;
 
 use crate::autorelay::login_param_from_host;
 use crate::config::Config;
+use crate::configure::MAX_RELAYS;
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::key::Fingerprint;
@@ -45,7 +46,7 @@ pub(crate) const DCBACKUP_VERSION: i32 = 5;
 /// Scanned QR code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Qr {
-    /// Ask the user whether to verify the contact.
+    /// Ask the user whether to start chatting with the contact.
     ///
     /// If the user agrees, pass this QR code to [`crate::securejoin::join_securejoin`].
     AskVerifyContact {
@@ -125,24 +126,12 @@ pub enum Qr {
         is_v3: bool,
     },
 
-    /// Contact fingerprint is verified.
+    /// Contact fingerprint matches.
     ///
     /// Ask the user if they want to start chatting.
     FprOk {
         /// Contact ID.
         contact_id: ContactId,
-    },
-
-    /// Scanned fingerprint does not match the last seen fingerprint.
-    FprMismatch {
-        /// Contact ID.
-        contact_id: Option<ContactId>,
-    },
-
-    /// The scanned QR code contains a fingerprint but no e-mail address.
-    FprWithoutAddr {
-        /// Key fingerprint.
-        fingerprint: String,
     },
 
     /// Ask the user if they want to create an account on the given domain.
@@ -500,7 +489,8 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
             addrs.push(normalize_address(primary_addr)?);
         };
         if let Some(secondary_addrs_raw) = param.get("r") {
-            for secondary_address in secondary_addrs_raw.split(',') {
+            let max_secondary = MAX_RELAYS.saturating_sub(addrs.len());
+            for secondary_address in secondary_addrs_raw.split(',').take(max_secondary) {
                 addrs.push(normalize_address(secondary_address)?)
             }
         }
@@ -651,24 +641,21 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
                 is_v3,
             })
         }
-    } else if let Some(addr) = addrs.first() {
-        let fingerprint = fingerprint.hex();
-        let (contact_id, _) =
-            Contact::add_or_lookup_ext(context, "", addr, &fingerprint, Origin::UnhandledQrScan)
-                .await?;
-        let contact = Contact::get_by_id(context, contact_id).await?;
-
-        if contact.public_key(context).await?.is_some() {
-            Ok(Qr::FprOk { contact_id })
-        } else {
-            Ok(Qr::FprMismatch {
-                contact_id: Some(contact_id),
-            })
-        }
     } else {
-        Ok(Qr::FprWithoutAddr {
-            fingerprint: fingerprint.human_readable(),
-        })
+        let fingerprint = fingerprint.hex();
+        let contact_id: Option<ContactId> = context
+            .sql
+            .query_get_value(
+                "SELECT id FROM contacts WHERE fingerprint=?",
+                (fingerprint,),
+            )
+            .await?;
+
+        let Some(contact_id) = contact_id else {
+            bail!("Contact matching the fingerprint is not found");
+        };
+
+        Ok(Qr::FprOk { contact_id })
     }
 }
 
@@ -777,7 +764,7 @@ fn decode_tg_socks_proxy(_context: &Context, qr: &str) -> Result<Qr> {
 fn decode_shadowsocks_proxy(qr: &str) -> Result<Qr> {
     let server_config = shadowsocks::config::ServerConfig::from_url(qr)?;
     let addr = server_config.addr();
-    let host = addr.host().to_string();
+    let host = addr.host();
     let port = addr.port();
     Ok(Qr::Proxy {
         url: qr.to_string(),
@@ -838,7 +825,8 @@ pub(crate) async fn login_param_from_account_qr(
         .context("Invalid DCACCOUNT scheme")?;
 
     if !payload.starts_with(HTTPS_SCHEME) {
-        let param = login_param_from_host(payload);
+        let mark_as_autorelay = false;
+        let param = login_param_from_host(payload, mark_as_autorelay);
         return Ok(param);
     }
 
@@ -1083,16 +1071,11 @@ async fn decode_matmsg(context: &Context, qr: &str) -> Result<Qr> {
     Qr::from_address(context, name, &addr, None).await
 }
 
-static VCARD_NAME_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?m)^N:([^;]*);([^;\n]*)").unwrap());
-static VCARD_EMAIL_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?m)^EMAIL([^:\n]*):([^;\n]*)").unwrap());
-
 /// Extract address for the vcard scheme.
 ///
 /// Scheme: `VCARD:BEGIN\nN:last name;first name;...;\nEMAIL;<type>:addr...;`
 async fn decode_vcard(context: &Context, qr: &str) -> Result<Qr> {
-    let name = VCARD_NAME_RE
+    let name = regex!(r"(?m)^N:([^;]*);([^;\n]*)")
         .captures(qr)
         .and_then(|caps| {
             let last_name = caps.get(1)?.as_str().trim();
@@ -1102,7 +1085,10 @@ async fn decode_vcard(context: &Context, qr: &str) -> Result<Qr> {
         })
         .unwrap_or_default();
 
-    let addr = if let Some(cap) = VCARD_EMAIL_RE.captures(qr).and_then(|caps| caps.get(2)) {
+    let addr = if let Some(cap) = regex!(r"(?m)^EMAIL([^:\n]*):([^;\n]*)")
+        .captures(qr)
+        .and_then(|caps| caps.get(2))
+    {
         normalize_address(cap.as_str().trim())?
     } else {
         bail!("Bad e-mail address");
@@ -1136,7 +1122,7 @@ fn normalize_address(addr: &str) -> Result<String> {
 
     ensure!(may_be_valid_addr(&new_addr), "Bad e-mail address");
 
-    Ok(new_addr.to_string())
+    Ok(new_addr)
 }
 
 #[cfg(test)]

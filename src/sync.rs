@@ -382,8 +382,9 @@ impl Context {
         Ok(())
     }
 
-    async fn sync_message_deletion(&self, msgs: &Vec<String>) -> Result<()> {
+    async fn sync_message_deletion(&self, msgs: &[String]) -> Result<()> {
         let mut modified_chat_ids = BTreeSet::new();
+        let mut pinned_messages_changed_chat_ids = BTreeSet::new();
         let mut msg_ids = Vec::new();
         for rfc724_mid in msgs {
             if let Some(msg_id) = message::rfc724_mid_exists(self, rfc724_mid).await? {
@@ -391,6 +392,9 @@ impl Context {
                     message::delete_msg_locally(self, &msg).await?;
                     msg_ids.push(msg.id);
                     modified_chat_ids.insert(msg.chat_id);
+                    if msg.is_pinned() {
+                        pinned_messages_changed_chat_ids.insert(msg.chat_id);
+                    }
                 } else {
                     warn!(self, "Sync message delete: Database entry does not exist.");
                 }
@@ -398,7 +402,13 @@ impl Context {
                 warn!(self, "Sync message delete: {rfc724_mid:?} not found.");
             }
         }
-        message::delete_msgs_locally_done(self, &msg_ids, modified_chat_ids).await?;
+        message::delete_msgs_locally_done(
+            self,
+            &msg_ids,
+            modified_chat_ids,
+            pinned_messages_changed_chat_ids,
+        )
+        .await?;
         Ok(())
     }
 }
@@ -703,9 +713,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_send_sync_msg_enables_bccself() -> Result<()> {
-        for (chatmail, sync_message_sent) in
-            [(false, false), (false, true), (true, false), (true, true)]
-        {
+        for sync_message_sent in [false, true] {
             let alice1 = TestContext::new_alice().await;
             let alice2 = TestContext::new_alice().await;
 
@@ -713,9 +721,6 @@ mod tests {
             // so we need to enable it
             alice1.set_config_bool(Config::SyncMsgs, true).await?;
             alice2.set_config_bool(Config::SyncMsgs, true).await?;
-
-            alice1.set_config_bool(Config::IsChatmail, chatmail).await?;
-            alice2.set_config_bool(Config::IsChatmail, chatmail).await?;
 
             alice1.set_config_bool(Config::BccSelf, true).await?;
             alice2.set_config_bool(Config::BccSelf, false).await?;
@@ -735,7 +740,7 @@ mod tests {
                 alice1.send_text(chat.id, "Hi").await
             };
 
-            // On chatmail accounts, BccSelf defaults to false.
+            // BccSelf defaults to false.
             // When receiving a sync message from another device,
             // there obviously is a multi-device-setup, and BccSelf
             // should be enabled.
